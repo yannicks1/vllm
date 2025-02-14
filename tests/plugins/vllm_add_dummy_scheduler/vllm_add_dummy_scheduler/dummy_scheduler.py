@@ -3,11 +3,7 @@
 from vllm.core.scheduler import Scheduler
 
 
-class CustomException(Exception):
-    pass
-
-
 class DummyScheduler(Scheduler):
 
     def schedule(self):
-        raise CustomException("Exception raised by DummyScheduler")
+        raise Exception("Exception raised by DummyScheduler")
