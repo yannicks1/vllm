@@ -487,6 +487,28 @@ class Gemma4Attention(nn.Module):
             is_neox_style=True,
         )
 
+        # Use kEqV backend for layers where K == V (only if FlashAttention
+        # is available and not overridden by model-level constraints like
+        # heterogeneous head dimensions).
+        _keqv_backend = None
+        if use_k_eq_v:
+            try:
+                from vllm.v1.attention.backends.flash_attn_keqv import (
+                    FlashAttentionKEqVBackend,
+                )
+                # Only use kEqV backend if:
+                # 1. The model hasn't forced a global backend (which would override us)
+                # 2. Or the forced backend is also FlashAttention-based
+                from vllm.config import get_current_vllm_config
+                vllm_config = get_current_vllm_config()
+                forced_backend = vllm_config.attention_config.backend
+
+                # If no backend is forced, or it's a flash-based one, we can use kEqV
+                if forced_backend is None or "FLASH" in str(forced_backend):
+                    _keqv_backend = FlashAttentionKEqVBackend
+            except ImportError:
+                pass  # fall back to standard backend (no cache saving on non-CUDA)
+
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -497,6 +519,7 @@ class Gemma4Attention(nn.Module):
             logits_soft_cap=attn_logits_soft_cap,
             per_layer_sliding_window=sliding_window,
             kv_sharing_target_layer_name=kv_sharing_target_layer_name,
+            attn_backend=_keqv_backend,
             prefix=f"{prefix}.attn",
         )
 

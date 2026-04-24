@@ -65,6 +65,11 @@ class AttentionBackend(ABC):
     # Does attention's forward() include kv cache update?
     forward_includes_kv_cache_update: bool = True
 
+    # When set to an integer, overrides head_size_v in get_kv_cache_spec so the
+    # cache spec reflects a different V storage size than the compute head_size_v.
+    # None (default) means use the layer's head_size_v unchanged.
+    kv_cache_head_size_v: ClassVar[int | None] = None
+
     @staticmethod
     def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
         return [MultipleOf(1)]
