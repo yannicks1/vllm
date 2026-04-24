@@ -7,8 +7,10 @@ from vllm import LLM, SamplingParams
 
 def main() -> None:
     llm = LLM(
-        model="google/gemma-4-E2B",
-        gpu_memory_utilization=0.45,
+        # model="google/gemma-4-E2B",
+        model="google/gemma-4-31B",
+        tensor_parallel_size=2,
+        gpu_memory_utilization=0.9,
         enforce_eager=True,
     )
     print("Starting generation")
