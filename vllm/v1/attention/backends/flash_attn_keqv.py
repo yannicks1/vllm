@@ -59,6 +59,28 @@ class FlashAttentionKEqVBackend(FlashAttentionBackend):
         # = exactly half of the standard (2, num_blocks, ...) layout.
         return (num_blocks, block_size, num_kv_heads, head_size)
 
+    @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        from vllm.v1.attention.backends.utils import get_kv_cache_layout
+
+        cache_layout = get_kv_cache_layout()
+        if cache_layout == "NHD" and include_num_layers_dimension:
+            # (num_blocks, num_layers, block_size, num_kv_heads, head_size)
+            return (1, 0, 2, 3, 4)
+        elif cache_layout == "NHD":
+            # (num_blocks, block_size, num_kv_heads, head_size) — identity
+            return (0, 1, 2, 3)
+        elif cache_layout == "HND" and include_num_layers_dimension:
+            # (num_blocks, num_kv_heads, num_layers, block_size, head_size)
+            return (1, 2, 0, 3, 4)
+        elif cache_layout == "HND":
+            # (num_blocks, block_size, num_kv_heads, head_size) → swap dims 1,2
+            return (0, 2, 1, 3)
+        else:
+            raise ValueError(f"Unknown cache layout: {cache_layout}")
+
 
 class FlashAttentionKEqVImpl(FlashAttentionImpl):
 
