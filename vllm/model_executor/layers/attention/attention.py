@@ -620,6 +620,12 @@ class Attention(nn.Module, AttentionLayerBase):
                 tq_slot_size=tq_config.slot_size_aligned,
             )
         else:
+            # For k_eq_v optimization (Gemma4): backends may override the cache spec's
+            # head_size_v independently of compute head_size_v. This allows allocating
+            # half the normal KV cache (storing only K, reusing for V) without changing
+            # the compute sizing. head_size_v=0 in the cache spec produces a half-size
+            # FullAttentionSpec.real_page_size_bytes, while self.head_size_v is used
+            # in forward() to correctly size output and reshape tensors.
             head_size_v = (
                 self.attn_backend.head_size_v_cache
                 if self.attn_backend.head_size_v_cache is not None

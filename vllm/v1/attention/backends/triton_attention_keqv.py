@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Triton attention backend for layers where V == K (k_eq_v).
+"""Triton attention backend for layers where V == K (k_eq_v optimization for Gemma4).
 
-Allocates a single K slab (half the normal KV cache), and passes the same
-tensor for both key_cache and value_cache. The Triton kernel writes
-redundantly but harmlessly to the same cache location.
+For models like Gemma4 where full-attention layers have identical K and V tensors,
+this backend allocates a single K slab (half the normal KV cache) and passes the same
+tensor for both key_cache and value_cache. The Triton kernel writes redundantly but
+harmlessly to the same cache location, saving 50% memory with no kernel changes.
 """
 
 from typing import TYPE_CHECKING, ClassVar
@@ -25,10 +26,11 @@ from vllm.v1.attention.backends.triton_attn import (
 
 
 class TritonAttentionKeqVBackend(TritonAttentionBackend):
-    """Triton attention backend for k_eq_v layers (K == V).
+    """Triton attention backend for k_eq_v layers (K == V) - Gemma4 optimization.
 
-    Stores only the K slab (half normal memory).
-    The same buffer is reused for both key_cache and value_cache at compute time.
+    Used for Gemma4 models where full-attention layers have identical K and V tensors.
+    Stores only the K slab (half normal memory) and reuses it for both key_cache and
+    value_cache at compute time, saving 50% KV cache memory without kernel changes.
     """
 
     head_size_v_cache: ClassVar[int | None] = 0
