@@ -15,11 +15,10 @@ def main() -> None:
     )
     print("Starting generation")
     outputs = llm.generate(
-        ["Write a short hello world program in Python."],
-        SamplingParams(),
+        ["Explain quantum computing in simple terms."],
+        SamplingParams(temperature=0.0, max_tokens=32),
     )
     print("Generation complete")
-    print('geits guet? ')
     print(outputs[0].outputs[0].text)
 
 
