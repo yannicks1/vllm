@@ -497,8 +497,12 @@ class Gemma4Attention(nn.Module):
                     TritonAttentionKeqVBackend,
                 )
                 attn_backend = TritonAttentionKeqVBackend
-            except ImportError:
-                pass  # fall back to model-level backend (no cache savings)
+            except ImportError as e:
+                logger.warning(
+                    "Could not load TritonAttentionKeqVBackend for k_eq_v optimization. "
+                    "Falling back to model-level backend (no KV cache savings). Error: %s",
+                    e,
+                )
 
         self.attn = Attention(
             self.num_heads,
