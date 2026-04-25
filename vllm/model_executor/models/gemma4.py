@@ -498,6 +498,10 @@ class Gemma4Attention(nn.Module):
                     TritonAttentionKeqVBackend,
                 )
                 attn_backend = TritonAttentionKeqVBackend
+                logger.info_once(
+                    "Using AttentionBackendEnum.TRITON_KEQV backend for global attention "
+                    "layers."
+                )
             except ImportError as e:
                 logger.warning(
                     "Could not load TritonAttentionKeqVBackend for k_eq_v optimization. "
