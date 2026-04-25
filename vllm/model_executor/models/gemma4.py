@@ -494,7 +494,7 @@ class Gemma4Attention(nn.Module):
         attn_backend = None
         if use_k_eq_v:
             try:
-                from vllm.v1.attention.backends.triton_attention_keqv import (
+                from vllm.v1.attention.backends.triton_attn_keqv import (
                     TritonAttentionKeqVBackend,
                 )
                 attn_backend = TritonAttentionKeqVBackend
