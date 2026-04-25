@@ -487,16 +487,16 @@ class Gemma4Attention(nn.Module):
             is_neox_style=True,
         )
 
-        # Use TritonKEqVBackend for k_eq_v layers to reduce KV cache by 50%.
+        # Use TritonAttentionKeqVBackend for k_eq_v layers to reduce KV cache by 50%.
         # (Stores only K, reuses as V, without kernel changes. Triton kernel writes
         # redundantly but harmlessly to same cache location for both K and V.)
-        _keqv_backend = None
+        attn_backend = None
         if use_k_eq_v:
             try:
-                from vllm.v1.attention.backends.triton_keqv import (
-                    TritonKEqVBackend,
+                from vllm.v1.attention.backends.triton_attention_keqv import (
+                    TritonAttentionKeqVBackend,
                 )
-                _keqv_backend = TritonKEqVBackend
+                attn_backend = TritonAttentionKeqVBackend
             except ImportError:
                 pass  # fall back to model-level backend (no cache savings)
 
@@ -510,7 +510,7 @@ class Gemma4Attention(nn.Module):
             logits_soft_cap=attn_logits_soft_cap,
             per_layer_sliding_window=sliding_window,
             kv_sharing_target_layer_name=kv_sharing_target_layer_name,
-            attn_backend=_keqv_backend,
+            attn_backend=attn_backend,
             prefix=f"{prefix}.attn",
         )
 

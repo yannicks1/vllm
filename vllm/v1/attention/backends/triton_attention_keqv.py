@@ -7,9 +7,12 @@ tensor for both key_cache and value_cache. The Triton kernel writes
 redundantly but harmlessly to the same cache location.
 """
 
-from typing import ClassVar
+from typing import TYPE_CHECKING, ClassVar
 
 import torch
+
+if TYPE_CHECKING:
+    from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
 
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import AttentionType
@@ -21,22 +24,22 @@ from vllm.v1.attention.backends.triton_attn import (
 )
 
 
-class TritonKEqVBackend(TritonAttentionBackend):
+class TritonAttentionKeqVBackend(TritonAttentionBackend):
     """Triton attention backend for k_eq_v layers (K == V).
 
     Stores only the K slab (half normal memory).
     The same buffer is reused for both key_cache and value_cache at compute time.
     """
 
-    kv_cache_head_size_v: ClassVar[int] = 0
+    head_size_v_cache: ClassVar[int | None] = 0
 
     @staticmethod
     def get_name() -> str:
         return "TRITON_KEQV"
 
     @staticmethod
-    def get_impl_cls():
-        return TritonKEqVImpl
+    def get_impl_cls() -> type["TritonAttentionKeqVImpl"]:
+        return TritonAttentionKeqVImpl  # type: ignore[name-defined]
 
     @staticmethod
     def get_kv_cache_shape(
@@ -72,7 +75,7 @@ class TritonKEqVBackend(TritonAttentionBackend):
             raise ValueError(f"Unknown cache layout: {cache_layout}")
 
 
-class TritonKEqVImpl(TritonAttentionImpl):
+class TritonAttentionKeqVImpl(TritonAttentionImpl):
 
     def forward(
         self,

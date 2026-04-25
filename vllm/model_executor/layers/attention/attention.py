@@ -620,16 +620,16 @@ class Attention(nn.Module, AttentionLayerBase):
                 tq_slot_size=tq_config.slot_size_aligned,
             )
         else:
-            cache_head_size_v = (
-                self.attn_backend.kv_cache_head_size_v
-                if self.attn_backend.kv_cache_head_size_v is not None
+            head_size_v = (
+                self.attn_backend.head_size_v_cache
+                if self.attn_backend.head_size_v_cache is not None
                 else self.head_size_v
             )
             return FullAttentionSpec(
                 block_size=block_size,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,
-                head_size_v=cache_head_size_v,
+                head_size_v=head_size_v,
                 dtype=self.kv_cache_torch_dtype,
                 kv_quant_mode=quant_mode,
             )
