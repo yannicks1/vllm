@@ -581,15 +581,14 @@ class Gemma4DecoderLayer(nn.Module):
         else:
             head_dim = config.head_dim
 
-        # Determine if this full-attention layer uses k_eq_v optimization (Gemma4).
-        # Laptop variant: checkpoint omits v_proj, and K is reused as V for these layers.
-        # At inference, TritonAttentionKeqVBackend stores only K in cache, reusing for V.
+        # Determine if this full-attention layer uses k_eq_v
+        # (laptop variant: no v_proj, K reused as V on full attention layers)
         use_k_eq_v = self.is_full_attention and getattr(
             config, "attention_k_eq_v", False
         )
 
         # For k_eq_v full-attention layers, use num_global_key_value_heads
-        # as the KV head count (checkpoint architecture where K == V).
+        # as the KV head count when k_eq_v is enabled.
         if use_k_eq_v:
             num_kv_heads = getattr(
                 config, "num_global_key_value_heads", config.num_key_value_heads
@@ -1641,11 +1640,9 @@ class Gemma4ForCausalLM(
         # model tree which is just "model.*".
         def _weight_iterator():
             use_k_eq_v = getattr(self.config, "attention_k_eq_v", False)
-            # Build set of k_eq_v layer indices (Gemma4 k_eq_v optimization).
-            # These are full_attention layers where the checkpoint has k_proj
-            # but no v_proj. We duplicate k_proj as v_proj, and use the
-            # TritonAttentionKeqVBackend at inference time to store only K and
-            # reuse it for V, saving 50% KV cache memory.
+            # Build set of k_eq_v layer indices (full_attention layers
+            # when attention_k_eq_v is enabled). These layers have k_proj
+            # but no v_proj in checkpoint — we duplicate k_proj as v_proj.
             k_eq_v_layer_indices: set[int] = set()
             if use_k_eq_v:
                 for idx, lt in enumerate(self.config.layer_types):
