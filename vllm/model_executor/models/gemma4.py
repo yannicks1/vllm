@@ -492,7 +492,12 @@ class Gemma4Attention(nn.Module):
         # stores only K and reuses it for V, without kernel changes. The Triton kernel
         # writes redundantly but harmlessly to the same cache location for both.
         attn_backend = None
-        if use_k_eq_v:
+
+        # Environment variable override for debugging: VLLM_KEQV_BACKEND=0 disables kEqV
+        import os
+        force_disable_keqv = os.environ.get("VLLM_KEQV_BACKEND") == "0"
+
+        if use_k_eq_v and not force_disable_keqv:
             try:
                 from vllm.v1.attention.backends.triton_attn_keqv import (
                     TritonAttentionKeqVBackend,
