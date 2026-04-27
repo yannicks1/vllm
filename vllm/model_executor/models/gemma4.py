@@ -491,7 +491,11 @@ class Gemma4Attention(nn.Module):
         # is available and not overridden by model-level constraints like
         # heterogeneous head dimensions).
         _keqv_backend = None
-        if use_k_eq_v:
+        # Environment variable override for debugging: VLLM_KEQV_BACKEND=0 disables kEqV
+        import os
+        force_disable_keqv = os.environ.get("VLLM_KEQV_BACKEND") == "0"
+
+        if use_k_eq_v and not force_disable_keqv:
             try:
                 from vllm.v1.attention.backends.flash_attn_keqv import (
                     FlashAttentionKEqVBackend,
