@@ -528,6 +528,18 @@ class Gemma4Attention(nn.Module):
             prefix=f"{prefix}.attn",
         )
 
+        # Register k_norm weight and RoPE tables so the KeqV backend can
+        # reconstruct K from the cached V at attention time.
+        if use_k_eq_v and not force_disable_keqv:
+            from vllm.v1.attention.backends.triton_attn_keqv import (
+                TritonAttentionKeqVImpl,
+            )
+            if isinstance(self.attn.impl, TritonAttentionKeqVImpl):
+                self.attn.impl.set_kraw_params(
+                    k_norm_weight=self.k_norm.weight,
+                    rotary_emb=self.rotary_emb,
+                )
+
     def forward(
         self,
         positions: torch.Tensor,

@@ -140,6 +140,14 @@ def kernel_unified_attention(
     # over ``SLIDING_WINDOW`` inside the helpers.  ``-1`` disables.
     CHUNK_LOOKBACK: tl.constexpr = -1,
     CHUNK_SIZE: tl.constexpr = -1,
+    # k_eq_v V-cache mode (Gemma4 global attention optimization).
+    # When True, both key_cache and value_cache store V = v_norm(k_raw).
+    # K is reconstructed inline via: K = neox_rope(V * k_norm_weight, position).
+    # k_norm_weight: (HEAD_SIZE,), cos_sin_cache: (max_pos, HEAD_SIZE).
+    USE_V_CACHE: tl.constexpr = False,
+    k_norm_weight_ptr=None,  # (HEAD_SIZE,) – ignored when USE_V_CACHE=False
+    cos_sin_cache_ptr=None,  # (max_pos, HEAD_SIZE) – ignored when USE_V_CACHE=False
+    cos_sin_stride: tl.int64 = 0,  # cos_sin_cache.stride(0) = HEAD_SIZE
 ):
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = KV_QUANT_MODE >= 2
 
@@ -250,19 +258,91 @@ def kernel_unified_attention(
             + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
         )
         # K : (HEAD_SIZE, TILE_SIZE)
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=dim_mask[:, None] & tile_mask[None, :],
-            other=0.0,
-        )
-        K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
         # V : (TILE_SIZE, HEAD_SIZE)
-        V_load = tl.load(
-            value_cache_ptr + v_offset,
-            mask=dim_mask[None, :] & tile_mask[:, None],
-            other=0.0,
-        )
-        V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
+        if USE_V_CACHE:
+            # ---- k_eq_v path: cache stores V = v_norm(k_raw) ----
+            # Reconstruct K = neox_rope(V * k_norm_weight, seq_offset).
+            # Both key_cache and value_cache hold the same V data.
+            HALF_HEAD: tl.constexpr = HEAD_SIZE_PADDED // 2
+
+            # Partner dim for neox-style pairing: d <-> d ± HALF_HEAD
+            offs_d_partner = tl.where(
+                offs_d < HALF_HEAD, offs_d + HALF_HEAD, offs_d - HALF_HEAD
+            )
+            k_partner_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d_partner[:, None] * stride_k_cache_3
+                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+            )
+
+            # Load V at current and partner dims (both from key_cache = V cache)
+            K_v = tl.load(
+                key_cache_ptr + k_offset,
+                mask=dim_mask[:, None] & tile_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            K_v_partner = tl.load(
+                key_cache_ptr + k_partner_offset,
+                mask=dim_mask[:, None] & tile_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+
+            # Scale by k_norm_weight at current and partner dims
+            k_w = tl.load(
+                k_norm_weight_ptr + offs_d, mask=dim_mask, other=1.0
+            ).to(tl.float32)
+            k_w_partner = tl.load(
+                k_norm_weight_ptr + offs_d_partner, mask=dim_mask, other=1.0
+            ).to(tl.float32)
+            K_scaled = K_v * k_w[:, None]
+            K_partner_scaled = K_v_partner * k_w_partner[:, None]
+
+            # RoPE: cos_sin_cache[pos, :HALF_HEAD]=cos, [HALF_HEAD:]=sin
+            # (Gemma4 zero-pads non-rotated dims, giving identity there)
+            cos_idx = offs_d % HALF_HEAD  # (HEAD_SIZE_PADDED,)
+            cos_vals = tl.load(
+                cos_sin_cache_ptr
+                + seq_offset[None, :] * cos_sin_stride
+                + cos_idx[:, None],
+                mask=dim_mask[:, None] & tile_mask[None, :],
+                other=1.0,
+            ).to(tl.float32)
+            sin_vals = tl.load(
+                cos_sin_cache_ptr
+                + seq_offset[None, :] * cos_sin_stride
+                + (cos_idx + HALF_HEAD)[:, None],
+                mask=dim_mask[:, None] & tile_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+
+            # sign: -1 for d < HALF_HEAD, +1 for d >= HALF_HEAD
+            sign = tl.where(offs_d < HALF_HEAD, -1.0, 1.0)
+            K = (
+                K_scaled * cos_vals + sign[:, None] * K_partner_scaled * sin_vals
+            ).to(Q.dtype)
+
+            # V: stored directly, load from value_cache unchanged
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :] & tile_mask[:, None],
+                other=0.0,
+            )
+            V = V_load.to(Q.dtype)
+        else:
+            # ---- standard path ----
+            K_load = tl.load(
+                key_cache_ptr + k_offset,
+                mask=dim_mask[:, None] & tile_mask[None, :],
+                other=0.0,
+            )
+            K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :] & tile_mask[:, None],
+                other=0.0,
+            )
+            V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
 
         # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
         if USE_PER_TOKEN_HEAD_SCALES:
@@ -538,6 +618,10 @@ def unified_attention(
     v_scale_cache=None,  # [num_blocks, block_size, num_kv_heads] float32
     # Chunked attention: restrict attention to aligned blocks with lookback.
     chunk_lookback=-1,
+    # k_eq_v V-cache mode: pass k_norm_weight and cos_sin_cache to reconstruct
+    # K inline.  Both None (default) → standard path (USE_V_CACHE=False).
+    k_norm_weight: torch.Tensor | None = None,
+    cos_sin_cache: torch.Tensor | None = None,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -723,6 +807,10 @@ def unified_attention(
         KV_QUANT_MODE=kv_quant_mode,
         CHUNK_LOOKBACK=chunk_lookback,
         CHUNK_SIZE=chunk_size,
+        USE_V_CACHE=(k_norm_weight is not None),
+        k_norm_weight_ptr=k_norm_weight if k_norm_weight is not None else q,
+        cos_sin_cache_ptr=cos_sin_cache if cos_sin_cache is not None else q,
+        cos_sin_stride=cos_sin_cache.stride(0) if cos_sin_cache is not None else 0,
     )
 
     if use_3d:

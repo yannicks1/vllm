@@ -1,11 +1,21 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Triton attention backend for layers where V == K (k_eq_v optimization for Gemma4).
+"""Triton attention backend for Gemma4 global attention layers (k_eq_v).
 
-For models like Gemma4 where full-attention layers have identical K and V tensors,
-this backend allocates a single K slab (half the normal KV cache) and passes the same
-tensor for both key_cache and value_cache. The Triton kernel writes redundantly but
-harmlessly to the same cache location, saving 50% memory with no kernel changes.
+Stores V = v_norm(k_raw) in a single 4D cache slab (no K/V split), saving
+50% KV cache memory vs. the standard 5D layout.  K is reconstructed inside
+the attention kernel via:
+
+    K[d] = V[d] * k_norm_weight[d] * cos(pos, d)
+           + sign(d) * V[d_partner] * k_norm_weight[d_partner] * sin(pos, d)
+
+where d_partner = d ± HEAD_SIZE/2  (neox-style rotation),
+      cos/sin come from the rotary embedding's cos_sin_cache,
+      and sign = -1 for d < HEAD_SIZE/2, +1 otherwise.
+
+For Gemma4's proportional RoPE (partial_rotary_factor=0.25) the
+non-rotated dims already have cos=1, sin=0 in the cache, so the formula
+degenerates to identity for those dims automatically.
 """
 
 from typing import TYPE_CHECKING, ClassVar
@@ -21,16 +31,14 @@ from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionBackend,
     TritonAttentionImpl,
     triton_reshape_and_cache_flash,
-    triton_reshape_and_cache_flash_per_token_head_quant,
 )
 
 
 class TritonAttentionKeqVBackend(TritonAttentionBackend):
-    """Triton attention backend for k_eq_v layers (K == V) - Gemma4 optimization.
+    """Triton attention backend for k_eq_v layers — Gemma4 global attention.
 
-    Used for Gemma4 models where full-attention layers have identical K and V tensors.
-    Stores only the K slab (half normal memory) and reuses it for both key_cache and
-    value_cache at compute time, saving 50% KV cache memory without kernel changes.
+    Cache stores only V = v_norm(k_raw); K is reconstructed inline in the
+    attention kernel using k_norm weights and RoPE tables, saving 50% memory.
     """
 
     head_size_v_cache: ClassVar[int | None] = 0
@@ -52,7 +60,7 @@ class TritonAttentionKeqVBackend(TritonAttentionBackend):
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         # 4D layout: (num_blocks, block_size, num_kv_heads, head_size).
-        # Only K is stored; V == K so same tensor is reused at compute time.
+        # Stores V only; K is reconstructed at attention time.
         return (num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
@@ -62,22 +70,48 @@ class TritonAttentionKeqVBackend(TritonAttentionBackend):
         from vllm.v1.attention.backends.utils import get_kv_cache_layout
         cache_layout = get_kv_cache_layout()
         if cache_layout == "NHD" and include_num_layers_dimension:
-            # (num_blocks, num_layers, block_size, num_kv_heads, head_size)
             return (1, 0, 2, 3, 4)
         elif cache_layout == "NHD":
-            # (num_blocks, block_size, num_kv_heads, head_size) — identity
             return (0, 1, 2, 3)
         elif cache_layout == "HND" and include_num_layers_dimension:
-            # (num_blocks, num_kv_heads, num_layers, block_size, head_size)
             return (1, 2, 0, 3, 4)
         elif cache_layout == "HND":
-            # (num_blocks, block_size, num_kv_heads, head_size) → swap dims 1,2
             return (0, 2, 1, 3)
         else:
             raise ValueError(f"Unknown cache layout: {cache_layout}")
 
 
 class TritonAttentionKeqVImpl(TritonAttentionImpl):
+    """Attention impl that stores V in the cache and reconstructs K on read."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Set by set_kraw_params() after the layer is built in the model.
+        self._k_norm_weight: torch.Tensor | None = None
+        self._cos_sin_cache: torch.Tensor | None = None
+
+    def set_kraw_params(
+        self,
+        k_norm_weight: torch.Tensor,
+        rotary_emb: torch.nn.Module,
+    ) -> None:
+        """Register k_norm weight and RoPE tables for K reconstruction.
+
+        Called once from Gemma4Attention.__init__ after the Attention layer is
+        created.
+
+        Args:
+            k_norm_weight: RMSNorm weight of shape (head_size,).
+            rotary_emb: The layer's RotaryEmbedding module; must expose
+                        ``cos_sin_cache`` of shape (max_positions, head_size)
+                        with cos in [:head_size//2] and sin in [head_size//2:].
+        """
+        self._k_norm_weight = k_norm_weight
+        if not hasattr(rotary_emb, "cos_sin_cache"):
+            raise AttributeError(
+                "rotary_emb has no cos_sin_cache; cannot use TritonAttentionKeqVImpl"
+            )
+        self._cos_sin_cache = rotary_emb.cos_sin_cache
 
     def forward(
         self,
@@ -91,26 +125,24 @@ class TritonAttentionKeqVImpl(TritonAttentionImpl):
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Forward pass for k_eq_v layers with 4D cache.
+        """Forward pass for k_eq_v layers.
 
-        Identical to parent forward() but doesn't unbind the cache
-        (no K/V split since they're the same tensor).
+        kv_cache stores V = v_norm(k_raw).  The attention kernel reconstructs
+        K inline using k_norm_weight and cos_sin_cache.
         """
         from vllm.v1.attention.backends.triton_attn import unified_attention
 
         if output_block_scale is not None:
             raise NotImplementedError(
-                "fused block_scale output quantization is not yet supported"
-                " for TritonKEqVImpl"
+                "fused block_scale output quantization is not supported "
+                "for TritonAttentionKeqVImpl"
             )
 
         if attn_metadata is None:
-            # Profiling run.
             return output.fill_(0)
 
         assert attn_metadata.use_cascade is False
 
-        # Check for encoder attention (no cache)
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             num_actual_tokens = attn_metadata.num_actual_tokens
             return self._forward_encoder_attention(
@@ -122,78 +154,66 @@ class TritonAttentionKeqVImpl(TritonAttentionImpl):
                 layer,
             )
 
+        if self._k_norm_weight is None or self._cos_sin_cache is None:
+            raise RuntimeError(
+                "TritonAttentionKeqVImpl.set_kraw_params() was never called. "
+                "Call it from Gemma4Attention.__init__ after creating Attention."
+            )
+
         num_actual_tokens = attn_metadata.num_actual_tokens
 
-        # Per-token-head quantized KV cache: use separate scale caches.
-        if self._is_per_token_head_quant:
-            self._ensure_scale_caches(kv_cache)
-            key_cache = kv_cache
-            value_cache = kv_cache  # V == K
-            if key_cache.dtype == torch.uint8:
-                key_cache = key_cache.view(self.fp8_dtype)
-                value_cache = key_cache
-            k_descale = None
-            v_descale = None
-            k_scale_cache = self._k_scale_cache
-            v_scale_cache = self._k_scale_cache  # K == V
-        # FP8 per-tensor / auto path (original flow).
-        else:
-            key_cache = kv_cache
-            value_cache = kv_cache  # V == K
-            if is_quantized_kv_cache(self.kv_cache_dtype):
-                if key_cache.dtype != self.fp8_dtype:
-                    key_cache = key_cache.view(self.fp8_dtype)
-                    value_cache = key_cache
-            k_descale = None  # For k_eq_v, K == V so no separate scales needed
-            v_descale = None
-            k_scale_cache = None
-            v_scale_cache = None
+        # 4D cache stores V = v_norm(k_raw); no K/V split.
+        # Quantized path not yet supported for this backend.
+        if self._is_per_token_head_quant or is_quantized_kv_cache(self.kv_cache_dtype):
+            raise NotImplementedError(
+                "Quantized KV cache is not yet supported for TritonAttentionKeqVImpl"
+            )
 
-        cu_seqlens_q = attn_metadata.query_start_loc
-        seqused_k = attn_metadata.seq_lens
-        max_seqlen_q = attn_metadata.max_query_len
-        max_seqlen_k = attn_metadata.max_seq_len
-        block_table = attn_metadata.block_table
+        v_cache = kv_cache  # stores V; K is reconstructed by the kernel
 
-        seq_threshold_3D = attn_metadata.seq_threshold_3D
-        num_par_softmax_segments = attn_metadata.num_par_softmax_segments
-        softmax_segm_output = attn_metadata.softmax_segm_output
-        softmax_segm_max = attn_metadata.softmax_segm_max
-        softmax_segm_expsum = attn_metadata.softmax_segm_expsum
+        # Ensure cos_sin_cache is on the same device as the query.
+        cos_sin = self._cos_sin_cache
+        if cos_sin.device != query.device:
+            cos_sin = cos_sin.to(query.device)
 
-        mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
+        k_norm_w = self._k_norm_weight
+        if k_norm_w.device != query.device:
+            k_norm_w = k_norm_w.to(query.device)
 
         unified_attention(
             q=query[:num_actual_tokens],
-            k=key_cache,
-            v=value_cache,
+            k=v_cache,   # key_cache_ptr reads V; kernel reconstructs K
+            v=v_cache,   # value_cache_ptr reads V directly
             out=output[:num_actual_tokens],
-            cu_seqlens_q=cu_seqlens_q,
-            max_seqlen_q=max_seqlen_q,
-            seqused_k=seqused_k,
-            max_seqlen_k=max_seqlen_k,
+            cu_seqlens_q=attn_metadata.query_start_loc,
+            max_seqlen_q=attn_metadata.max_query_len,
+            seqused_k=attn_metadata.seq_lens,
+            max_seqlen_k=attn_metadata.max_seq_len,
             softmax_scale=self.scale,
             causal=True,
             alibi_slopes=self.alibi_slopes,
             use_alibi_sqrt=self.use_alibi_sqrt,
             window_size=self.sliding_window,
-            block_table=block_table,
+            block_table=attn_metadata.block_table,
             softcap=self.logits_soft_cap,
-            q_descale=None,  # Not supported
-            k_descale=k_descale,
-            v_descale=v_descale,
-            seq_threshold_3D=seq_threshold_3D,
-            num_par_softmax_segments=num_par_softmax_segments,
-            softmax_segm_output=softmax_segm_output,
-            softmax_segm_max=softmax_segm_max,
-            softmax_segm_expsum=softmax_segm_expsum,
+            q_descale=None,
+            k_descale=None,
+            v_descale=None,
+            seq_threshold_3D=attn_metadata.seq_threshold_3D,
+            num_par_softmax_segments=attn_metadata.num_par_softmax_segments,
+            softmax_segm_output=attn_metadata.softmax_segm_output,
+            softmax_segm_max=attn_metadata.softmax_segm_max,
+            softmax_segm_expsum=attn_metadata.softmax_segm_expsum,
             sinks=self.sinks,
             output_scale=output_scale,
-            mm_prefix_range=mm_prefix_range_tensor,
+            mm_prefix_range=attn_metadata.mm_prefix_range_tensor,
             kv_quant_mode=self._kv_quant_mode,
-            k_scale_cache=k_scale_cache,
-            v_scale_cache=v_scale_cache,
+            k_scale_cache=None,
+            v_scale_cache=None,
             chunk_lookback=self.chunk_lookback,
+            # V-cache K reconstruction:
+            k_norm_weight=k_norm_w,
+            cos_sin_cache=cos_sin,
         )
 
         return output
@@ -206,42 +226,30 @@ class TritonAttentionKeqVImpl(TritonAttentionImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ):
+        """Write V = v_norm(k_raw) to the 4D cache.
+
+        ``value`` is v_norm(k_raw) — already computed by Gemma4Attention.forward.
+        ``key`` (processed K = k_norm + RoPE) is not stored; it is discarded.
+        K is reconstructed from the cached V at attention time.
+        """
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             return
-        # kv_cache: (num_blocks, block_size, num_kv_heads, head_size) — K only.
-        # For k_eq_v, pass the same cache for both K and V.
-        # The kernel will write key/value redundantly (both to same location),
-        # which is harmless and avoids the memory overhead of storing V separately.
 
-        if self._is_per_token_head_quant:
-            self._ensure_scale_caches(kv_cache)
-            key_cache = kv_cache
-            if key_cache.dtype == torch.uint8:
-                key_cache = key_cache.view(self.fp8_dtype)
-            value_cache = key_cache  # V == K
-            triton_reshape_and_cache_flash_per_token_head_quant(
-                key,
-                key,  # V == K
-                key_cache,
-                value_cache,
-                self._k_scale_cache,
-                self._k_scale_cache,  # no separate v_scale
-                slot_mapping,
+        if self._is_per_token_head_quant or is_quantized_kv_cache(self.kv_cache_dtype):
+            raise NotImplementedError(
+                "Quantized KV cache is not yet supported for TritonAttentionKeqVImpl"
             )
-            return
-        # For decoder and cross-attention, use KV cache as before.
-        key_cache = kv_cache
-        value_cache = kv_cache  # V == K
-        if is_quantized_kv_cache(self.kv_cache_dtype):
-            key_cache = key_cache.view(self.fp8_dtype)
-            value_cache = key_cache
+
+        # Write V to the single 4D cache slab.
+        # key_cache == value_cache (same 4D tensor), so the kernel writes V
+        # to both K and V slots which happen to be the same memory location.
         triton_reshape_and_cache_flash(
-            key,
-            key,  # V == K
-            key_cache,
-            value_cache,
+            value,      # write V, not key
+            value,      # same data for both cache halves (they share storage)
+            kv_cache,   # key_cache  = 4D slab
+            kv_cache,   # value_cache = same 4D slab
             slot_mapping,
             self.kv_cache_dtype,
             layer._k_scale,
-            layer._k_scale,  # no separate v_scale
+            layer._v_scale,
         )
