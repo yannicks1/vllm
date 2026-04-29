@@ -487,13 +487,11 @@ class Gemma4Attention(nn.Module):
             is_neox_style=True,
         )
 
-        # For Gemma4 k_eq_v optimization: use TritonAttentionKeqVBackend on full-attention
-        # layers where K == V (identical tensors) to reduce KV cache by 50%. This backend
-        # stores only K and reuses it for V, without kernel changes. The Triton kernel
-        # writes redundantly but harmlessly to the same cache location for both.
+        # Gemma4 k_eq_v optimization: store only V in cache, reconstruct K
+        # from V at attention time using K = RoPE(V * k_norm_weight).
+        # Saves 50% KV cache on global attention layers.
         attn_backend = None
 
-        # Environment variable override for debugging: VLLM_KEQV_BACKEND=0 disables kEqV
         import os
         force_disable_keqv = os.environ.get("VLLM_KEQV_BACKEND") == "0"
 
@@ -504,13 +502,13 @@ class Gemma4Attention(nn.Module):
                 )
                 attn_backend = TritonAttentionKeqVBackend
                 logger.info_once(
-                    "Using AttentionBackendEnum.TRITON_KEQV backend for global attention "
-                    "layers."
+                    "Using TritonAttentionKeqVBackend for k_eq_v global attention "
+                    "layers (50%% KV cache savings)."
                 )
             except ImportError as e:
                 logger.warning(
-                    "Could not load TritonAttentionKeqVBackend for k_eq_v optimization. "
-                    "Falling back to model-level backend (no KV cache savings). Error: %s",
+                    "Could not load TritonAttentionKeqVBackend for k_eq_v. "
+                    "Falling back to standard backend. Error: %s",
                     e,
                 )
 

@@ -65,11 +65,8 @@ class AttentionBackend(ABC):
     # Does attention's forward() include kv cache update?
     forward_includes_kv_cache_update: bool = True
 
-    # Override for k_eq_v optimization (Gemma4): when set to an integer, controls
-    # the cache spec's head_size_v independently of compute head_size_v. This enables
-    # backends to allocate half the normal KV cache (head_size_v=0) by storing only K
-    # and reusing it for V, without kernel changes. Compute still uses self.head_size_v
-    # to correctly shape output tensors. None (default) means use compute head_size_v.
+    # Override for cache spec's head_size_v (e.g., Gemma4 k_eq_v sets this to 0
+    # to store only V in cache, halving KV cache memory). None = use compute head_size_v.
     head_size_v_cache: ClassVar[int | None] = None
 
     @staticmethod
