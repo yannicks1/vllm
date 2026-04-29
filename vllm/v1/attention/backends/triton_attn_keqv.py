@@ -32,6 +32,7 @@ import torch
 if TYPE_CHECKING:
     from vllm.v1.attention.backends.triton_attn import TritonAttentionImpl
 
+from vllm.config.cache import CacheDType
 from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import is_quantized_kv_cache
 from vllm.v1.attention.backend import AttentionType
@@ -196,9 +197,31 @@ class TritonAttentionKeqVBackend(TritonAttentionBackend):
 
     head_size_v_cache: ClassVar[int | None] = 0
 
+    supported_dtypes: ClassVar[list[torch.dtype]] = [
+        torch.float16,
+        torch.bfloat16,
+    ]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto"]
+
     @staticmethod
     def get_name() -> str:
         return "TRITON_ATTN_KEQV"
+
+    @classmethod
+    def supports_block_size(cls, block_size: int | None) -> bool:
+        return True
+
+    @classmethod
+    def supports_sink(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        return False
+
+    @classmethod
+    def supports_attn_type(cls, attn_type: str) -> bool:
+        return attn_type == AttentionType.DECODER
 
     @staticmethod
     def get_impl_cls() -> type["TritonAttentionKeqVImpl"]:
