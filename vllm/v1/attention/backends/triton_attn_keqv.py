@@ -89,6 +89,7 @@ class TritonAttentionKeqVImpl(TritonAttentionImpl):
         # Set by set_kraw_params() after the layer is built in the model.
         self._k_norm_weight: torch.Tensor | None = None
         self._cos_sin_cache: torch.Tensor | None = None
+        self._rotary_pairs: int = -1
 
     def set_kraw_params(
         self,
@@ -112,6 +113,9 @@ class TritonAttentionKeqVImpl(TritonAttentionImpl):
                 "rotary_emb has no cos_sin_cache; cannot use TritonAttentionKeqVImpl"
             )
         self._cos_sin_cache = rotary_emb.cos_sin_cache
+        self._rotary_pairs = getattr(
+            rotary_emb, "rope_angles", self.head_size // 2
+        )
 
     def forward(
         self,
@@ -214,6 +218,7 @@ class TritonAttentionKeqVImpl(TritonAttentionImpl):
             # V-cache K reconstruction:
             k_norm_weight=k_norm_w,
             cos_sin_cache=cos_sin,
+            rotary_pairs=self._rotary_pairs,
         )
 
         return output

@@ -145,6 +145,10 @@ def kernel_unified_attention(
     # K is reconstructed inline via: K = neox_rope(V * k_norm_weight, position).
     # k_norm_weight: (HEAD_SIZE,), cos_sin_cache: (max_pos, HEAD_SIZE).
     USE_V_CACHE: tl.constexpr = False,
+    # Number of rotation pairs with actual rotation (dims with non-trivial
+    # cos/sin). -1 means all dims rotated. For Gemma4 with
+    # partial_rotary_factor=0.25 and head_size=512, ROTARY_PAIRS=64.
+    ROTARY_PAIRS: tl.constexpr = -1,
     k_norm_weight_ptr=None,  # (HEAD_SIZE,) – ignored when USE_V_CACHE=False
     cos_sin_cache_ptr=None,  # (max_pos, HEAD_SIZE) – ignored when USE_V_CACHE=False
     cos_sin_stride: tl.int64 = 0,  # cos_sin_cache.stride(0) = HEAD_SIZE
@@ -236,6 +240,25 @@ def kernel_unified_attention(
         CHUNK_SIZE,
     )
 
+    # --- V-cache hoisted state (loop-invariant) ---
+    if USE_V_CACHE:
+        HALF_HEAD: tl.constexpr = HEAD_SIZE_PADDED // 2
+        k_w = tl.load(
+            k_norm_weight_ptr + offs_d, mask=dim_mask, other=1.0
+        ).to(tl.float32)
+        offs_d_partner = tl.where(
+            offs_d < HALF_HEAD, offs_d + HALF_HEAD, offs_d - HALF_HEAD
+        )
+        # rot_mask: True only for dims that undergo actual rotation.
+        if ROTARY_PAIRS >= 0:
+            rot_mask = ((offs_d % HALF_HEAD) < ROTARY_PAIRS) & dim_mask
+        else:
+            rot_mask = dim_mask
+        k_w_partner = tl.load(
+            k_norm_weight_ptr + offs_d_partner, mask=rot_mask, other=0.0
+        ).to(tl.float32)
+        vcache_sign = tl.where(offs_d < HALF_HEAD, -1.0, 1.0)
+
     # iterate through tiles (now limited to the sliding window range)
     for j in range(loop_lo, loop_hi):
         seq_offset = j * TILE_SIZE + offs_t
@@ -261,74 +284,57 @@ def kernel_unified_attention(
         # V : (TILE_SIZE, HEAD_SIZE)
         if USE_V_CACHE:
             # ---- k_eq_v path: cache stores V = v_norm(k_raw) ----
-            # Reconstruct K = neox_rope(V * k_norm_weight, seq_offset).
-            # Both key_cache and value_cache hold the same V data.
-            HALF_HEAD: tl.constexpr = HEAD_SIZE_PADDED // 2
+            # Reconstruct K = neox_rope(V * k_norm_weight, position).
+            # V is reused for P@V via transpose (single cache read).
 
-            # Partner dim for neox-style pairing: d <-> d ± HALF_HEAD
-            offs_d_partner = tl.where(
-                offs_d < HALF_HEAD, offs_d + HALF_HEAD, offs_d - HALF_HEAD
-            )
-            k_partner_offset = (
-                physical_block_idx[None, :] * stride_k_cache_0
-                + kv_head_idx * stride_k_cache_2
-                + offs_d_partner[:, None] * stride_k_cache_3
-                + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-            )
-
-            # Load V at current and partner dims (both from key_cache = V cache)
-            K_v = tl.load(
+            # Single load from V cache in K-format (HEAD_SIZE_PADDED, TILE_SIZE)
+            V_raw = tl.load(
                 key_cache_ptr + k_offset,
                 mask=dim_mask[:, None] & tile_mask[None, :],
                 other=0.0,
             ).to(tl.float32)
-            K_v_partner = tl.load(
-                key_cache_ptr + k_partner_offset,
-                mask=dim_mask[:, None] & tile_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
 
-            # Scale by k_norm_weight at current and partner dims
-            k_w = tl.load(
-                k_norm_weight_ptr + offs_d, mask=dim_mask, other=1.0
-            ).to(tl.float32)
-            k_w_partner = tl.load(
-                k_norm_weight_ptr + offs_d_partner, mask=dim_mask, other=1.0
-            ).to(tl.float32)
-            K_scaled = K_v * k_w[:, None]
-            K_partner_scaled = K_v_partner * k_w_partner[:, None]
+            # V for P@V: reuse via transpose (eliminates separate V load)
+            V = tl.trans(V_raw).to(Q.dtype)
 
-            # RoPE: cos_sin_cache[pos, :HALF_HEAD]=cos, [HALF_HEAD:]=sin
-            # (Gemma4 zero-pads non-rotated dims, giving identity there)
-            cos_idx = offs_d % HALF_HEAD  # (HEAD_SIZE_PADDED,)
-            cos_vals = tl.load(
-                cos_sin_cache_ptr
-                + seq_offset[None, :] * cos_sin_stride
-                + cos_idx[:, None],
-                mask=dim_mask[:, None] & tile_mask[None, :],
-                other=1.0,
-            ).to(tl.float32)
-            sin_vals = tl.load(
-                cos_sin_cache_ptr
-                + seq_offset[None, :] * cos_sin_stride
-                + (cos_idx + HALF_HEAD)[:, None],
-                mask=dim_mask[:, None] & tile_mask[None, :],
-                other=0.0,
-            ).to(tl.float32)
+            # K base: V * k_norm_weight (identity for non-rotated dims)
+            K = V_raw * k_w[:, None]
 
-            # sign: -1 for d < HALF_HEAD, +1 for d >= HALF_HEAD
-            sign = tl.where(offs_d < HALF_HEAD, -1.0, 1.0)
-            K = (
-                K_scaled * cos_vals + sign[:, None] * K_partner_scaled * sin_vals
-            ).to(Q.dtype)
+            # Apply neox rotation only to dims that have actual rotation
+            if ROTARY_PAIRS != 0:
+                k_partner_offset = (
+                    physical_block_idx[None, :] * stride_k_cache_0
+                    + kv_head_idx * stride_k_cache_2
+                    + offs_d_partner[:, None] * stride_k_cache_3
+                    + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
+                )
+                V_partner = tl.load(
+                    key_cache_ptr + k_partner_offset,
+                    mask=rot_mask[:, None] & tile_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+                K_partner = V_partner * k_w_partner[:, None]
 
-            # V: stored directly, load from value_cache unchanged
-            V_load = tl.load(
-                value_cache_ptr + v_offset,
-                mask=dim_mask[None, :] & tile_mask[:, None],
-                other=0.0,
-            )
-            V = V_load.to(Q.dtype)
+                cos_idx = offs_d % HALF_HEAD
+                cos_vals = tl.load(
+                    cos_sin_cache_ptr
+                    + seq_offset[None, :] * cos_sin_stride
+                    + cos_idx[:, None],
+                    mask=rot_mask[:, None] & tile_mask[None, :],
+                    other=1.0,
+                ).to(tl.float32)
+                sin_vals = tl.load(
+                    cos_sin_cache_ptr
+                    + seq_offset[None, :] * cos_sin_stride
+                    + (cos_idx + HALF_HEAD)[:, None],
+                    mask=rot_mask[:, None] & tile_mask[None, :],
+                    other=0.0,
+                ).to(tl.float32)
+
+                K_rot = K * cos_vals + vcache_sign[:, None] * K_partner * sin_vals
+                K = tl.where(rot_mask[:, None], K_rot, K)
+
+            K = K.to(Q.dtype)
         else:
             # ---- standard path ----
             K_load = tl.load(
@@ -622,6 +628,9 @@ def unified_attention(
     # K inline.  Both None (default) → standard path (USE_V_CACHE=False).
     k_norm_weight: torch.Tensor | None = None,
     cos_sin_cache: torch.Tensor | None = None,
+    # Number of rotation pairs with non-trivial cos/sin values.
+    # -1 = all dims rotated (safe fallback). For Gemma4: 64.
+    rotary_pairs: int = -1,
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -808,6 +817,7 @@ def unified_attention(
         CHUNK_LOOKBACK=chunk_lookback,
         CHUNK_SIZE=chunk_size,
         USE_V_CACHE=(k_norm_weight is not None),
+        ROTARY_PAIRS=rotary_pairs if k_norm_weight is not None else -1,
         k_norm_weight_ptr=k_norm_weight if k_norm_weight is not None else q,
         cos_sin_cache_ptr=cos_sin_cache if cos_sin_cache is not None else q,
         cos_sin_stride=cos_sin_cache.stride(0) if cos_sin_cache is not None else 0,
