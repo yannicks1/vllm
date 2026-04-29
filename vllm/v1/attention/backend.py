@@ -65,8 +65,9 @@ class AttentionBackend(ABC):
     # Does attention's forward() include kv cache update?
     forward_includes_kv_cache_update: bool = True
 
-    # Override for cache spec's head_size_v (e.g., Gemma4 k_eq_v sets this to 0
-    # to store only V in cache, halving KV cache memory). None = use compute head_size_v.
+    # Override for cache spec's head_size_v (e.g., Gemma4 k_eq_v attention 
+    # sets this to 0 to store only V in cache, halving KV cache memory
+    # default: None -> using compute head_size_v
     head_size_v_cache: ClassVar[int | None] = None
 
     @staticmethod

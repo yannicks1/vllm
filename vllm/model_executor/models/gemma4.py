@@ -489,7 +489,7 @@ class Gemma4Attention(nn.Module):
 
         # Gemma4 k_eq_v optimization: store only V in cache, reconstruct K
         # from V at attention time using K = RoPE(V * k_norm_weight).
-        # Saves 50% KV cache on global attention layers.
+        # Saves 50% KV cache on k_eq_v global attention layers.
         attn_backend = None
 
         import os
@@ -503,7 +503,7 @@ class Gemma4Attention(nn.Module):
                 attn_backend = TritonAttentionKeqVBackend
                 logger.info_once(
                     "Using TritonAttentionKeqVBackend for k_eq_v global attention "
-                    "layers (50%% KV cache savings)."
+                    "layers (50% KV cache savings)."
                 )
             except ImportError as e:
                 logger.warning(
@@ -527,7 +527,7 @@ class Gemma4Attention(nn.Module):
         )
 
         # Register k_norm weight and RoPE tables so the KeqV backend can
-        # reconstruct K from the cached V at attention time.
+        # reconstruct K from the cached V at inference time on the fly.
         if use_k_eq_v and not force_disable_keqv:
             from vllm.v1.attention.backends.triton_attn_keqv import (
                 TritonAttentionKeqVImpl,

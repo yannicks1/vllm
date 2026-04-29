@@ -3,17 +3,17 @@
 """Triton attention backend for Gemma4 global attention layers (k_eq_v).
 
 Saves ~50% KV cache memory on global layers by storing only V in the
-persistent per-layer cache.  K is reconstructed from V before the standard
+persistent per-layer cache. K is reconstructed from V before the standard
 attention kernel runs, using the algebraic identity:
 
     K = RoPE(V * k_norm_weight)
 
 This works because both k_norm and v_norm are RMS norms applied to the same
 k_raw input (shared weights due to k_eq_v), and v_norm has no learnable
-weight.  The RMS terms cancel: K_pre_rope = V * k_norm_weight.
+weight. The RMS terms cancel: K_pre_rope = V * k_norm_weight.
 
 A lightweight Triton kernel reconstructs K for ALL positions into a shared
-scratch buffer before each layer's attention.  The attention kernel itself
+scratch buffer before each layer's attention. The attention kernel itself
 is completely standard (unmodified) — no performance penalty.
 
 Memory layout:
@@ -21,7 +21,7 @@ Memory layout:
 - Scratch buffer: one layer's worth of K, shared across all k_eq_v layers
   (layers execute sequentially, so only one is live at a time)
 - Memory reservation: 1GB allocated during model init (before KV cache
-  profiling) so the profiler sees reduced available memory.  Freed at runtime
+  profiling) so the profiler sees reduced available memory. Freed at runtime
   when the real scratch is allocated.
 """
 
@@ -203,7 +203,7 @@ class TritonAttentionKeqVBackend(TritonAttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "TRITON_KEQV"
+        return "TRITON_ATTN_KEQV"
 
     @staticmethod
     def get_impl_cls() -> type["TritonAttentionKeqVImpl"]:
@@ -218,7 +218,7 @@ class TritonAttentionKeqVBackend(TritonAttentionBackend):
         cache_dtype_str: str = "auto",
     ) -> tuple[int, ...]:
         # 4D layout: (num_blocks, block_size, num_kv_heads, head_size).
-        # Stores V only; K is reconstructed from V at attention time.
+        # Stores V only; K is reconstructed from V at runtime.
         return (num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod

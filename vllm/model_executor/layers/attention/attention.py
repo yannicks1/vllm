@@ -621,8 +621,8 @@ class Attention(nn.Module, AttentionLayerBase):
             )
         else:
             # Backends may override the cache spec's head_size_v (e.g., Gemma4
-            # k_eq_v stores only V, setting head_size_v_cache=0 to halve the
-            # KV cache while keeping compute head_size_v unchanged).
+            # k_eq_v layers stores only V, setting cache head_size_v=0 to halve 
+            # the KV cache while keeping compute head_size_v unchanged).
             head_size_v = (
                 self.attn_backend.head_size_v_cache
                 if self.attn_backend.head_size_v_cache is not None
