@@ -42,10 +42,10 @@ from vllm.v1.attention.backends.triton_attn import (
     unified_attention,
 )
 
-
 # --------------------------------------------------------------------------
 # Reconstruction kernel: V → K for all cached positions
 # --------------------------------------------------------------------------
+
 
 @triton.jit
 def _reconstruct_k_from_v_kernel(
@@ -79,9 +79,9 @@ def _reconstruct_k_from_v_kernel(
     if block_idx * BLOCK_SIZE >= seq_len:
         return
 
-    phys_block = tl.load(
-        block_table_ptr + seq_idx * block_table_stride + block_idx
-    ).to(tl.int64)
+    phys_block = tl.load(block_table_ptr + seq_idx * block_table_stride + block_idx).to(
+        tl.int64
+    )
 
     # Slot positions and mask
     offs_slot = tl.arange(0, BLOCK_SIZE)
@@ -97,14 +97,8 @@ def _reconstruct_k_from_v_kernel(
     base_off = phys_block * cache_stride_blk + head_idx * cache_stride_head
 
     # Load V first half: [BLOCK_SIZE, HALF_HEAD]
-    v_first_off = (
-        base_off
-        + offs_slot[:, None] * cache_stride_slot
-        + offs_half[None, :]
-    )
-    V_first_raw = tl.load(
-        v_cache_ptr + v_first_off, mask=slot_mask[:, None], other=0.0
-    )
+    v_first_off = base_off + offs_slot[:, None] * cache_stride_slot + offs_half[None, :]
+    V_first_raw = tl.load(v_cache_ptr + v_first_off, mask=slot_mask[:, None], other=0.0)
     V_first = V_first_raw.to(tl.float32)
 
     # Load V second half: [BLOCK_SIZE, HALF_HEAD]
@@ -192,6 +186,7 @@ def reconstruct_k_from_v(
 # Backend and Impl classes
 # --------------------------------------------------------------------------
 
+
 class TritonAttentionKeqVBackend(TritonAttentionBackend):
     """Triton attention backend for k_eq_v layers — Gemma4 global attention.
 
@@ -226,6 +221,7 @@ class TritonAttentionKeqVBackend(TritonAttentionBackend):
         include_num_layers_dimension: bool = False,
     ) -> tuple[int, ...]:
         from vllm.v1.attention.backends.utils import get_kv_cache_layout
+
         cache_layout = get_kv_cache_layout()
         if cache_layout == "NHD" and include_num_layers_dimension:
             return (1, 0, 2, 3, 4)
@@ -281,9 +277,11 @@ class TritonAttentionKeqVImpl(TritonAttentionImpl):
     @classmethod
     def _get_k_scratch(cls, kv_cache: torch.Tensor) -> torch.Tensor:
         """Return (and lazily allocate) the shared K scratch buffer."""
-        if (cls._shared_k_scratch is None
-                or cls._shared_k_scratch.shape != kv_cache.shape
-                or cls._shared_k_scratch.device != kv_cache.device):
+        if (
+            cls._shared_k_scratch is None
+            or cls._shared_k_scratch.shape != kv_cache.shape
+            or cls._shared_k_scratch.device != kv_cache.device
+        ):
             cls._memory_reservation = None
             cls._shared_k_scratch = torch.empty_like(kv_cache)
         return cls._shared_k_scratch

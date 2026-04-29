@@ -493,6 +493,7 @@ class Gemma4Attention(nn.Module):
         attn_backend = None
 
         import os
+
         force_disable_keqv = os.environ.get("VLLM_KEQV_BACKEND") == "0"
 
         if use_k_eq_v and not force_disable_keqv:
@@ -500,6 +501,7 @@ class Gemma4Attention(nn.Module):
                 from vllm.v1.attention.backends.triton_attn_keqv import (
                     TritonAttentionKeqVBackend,
                 )
+
                 attn_backend = TritonAttentionKeqVBackend
                 logger.info_once(
                     "Using TritonAttentionKeqVBackend for k_eq_v global attention "
@@ -532,6 +534,7 @@ class Gemma4Attention(nn.Module):
             from vllm.v1.attention.backends.triton_attn_keqv import (
                 TritonAttentionKeqVImpl,
             )
+
             if isinstance(self.attn.impl, TritonAttentionKeqVImpl):
                 self.attn.impl.set_kraw_params(
                     k_norm_weight=self.k_norm.weight,
