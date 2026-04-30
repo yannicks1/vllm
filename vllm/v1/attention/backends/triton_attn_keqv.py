@@ -197,10 +197,9 @@ class TritonAttentionKeqVBackend(TritonAttentionBackend):
 
     head_size_v_cache: ClassVar[int | None] = 0
 
-    supported_dtypes: ClassVar[list[torch.dtype]] = [
-        torch.float16,
-        torch.bfloat16,
-    ]
+    # Only native-dtype cache is supported. Quantized KV cache (fp8, int8)
+    # would require adding dequantization to the reconstruction kernel before
+    # the V * k_norm_weight multiply — currently it reads raw V values directly.
     supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto"]
 
     @staticmethod
@@ -208,15 +207,15 @@ class TritonAttentionKeqVBackend(TritonAttentionBackend):
         return "TRITON_ATTN_KEQV"
 
     @classmethod
-    def supports_block_size(cls, block_size: int | None) -> bool:
-        return True
-
-    @classmethod
     def supports_sink(cls) -> bool:
+        # Sinks are passed through to unified_attention and should work
+        # (reconstruction kernel processes all positions), but untested.
         return False
 
     @classmethod
     def supports_mm_prefix(cls) -> bool:
+        # MM prefix is passed through to unified_attention and should work
+        # (reconstruction kernel is agnostic to it), but untested.
         return False
 
     @classmethod
@@ -225,7 +224,7 @@ class TritonAttentionKeqVBackend(TritonAttentionBackend):
 
     @staticmethod
     def get_impl_cls() -> type["TritonAttentionKeqVImpl"]:
-        return TritonAttentionKeqVImpl  # type: ignore[name-defined]
+        return TritonAttentionKeqVImpl
 
     @staticmethod
     def get_kv_cache_shape(
@@ -284,6 +283,21 @@ class TritonAttentionKeqVImpl(TritonAttentionImpl):
 
         Called during model init (before KV cache profiling). The reservation
         is measured as model memory, reducing available KV cache budget.
+
+        Memory reservation limitation:
+        The scratch buffer is allocated lazily as torch.empty_like(kv_cache),
+        i.e. its size = num_blocks x block_size x num_kv_heads x head_size x
+        element_size. This scales with num_blocks (determined by the profiler)
+        and num_kv_heads (affected by TP degree). A fixed 1GB reservation is
+        an approximation:
+          - TP=1, 80GB GPU: scratch may be ~1-2GB (reservation could be low)
+          - TP=8, 80GB GPU: scratch may be ~125-250MB (reservation too high)
+        The correct fix is to account for the scratch in the per-block page
+        budget (e.g. a framework-level extra_memory_per_block field in
+        KVCacheSpec), so the profiler computes num_blocks = available_memory /
+        (per_block_all_layers + per_block_scratch). This requires deeper
+        framework support. For now, we reserve a fixed 1GB per layer as a
+        heuristic until better support is available.
         """
         self._k_norm_weight = k_norm_weight
         self._rotary_emb = rotary_emb
@@ -333,17 +347,6 @@ class TritonAttentionKeqVImpl(TritonAttentionImpl):
             return output.fill_(0)
 
         assert attn_metadata.use_cascade is False
-
-        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
-            num_actual_tokens = attn_metadata.num_actual_tokens
-            return self._forward_encoder_attention(
-                query[:num_actual_tokens],
-                key[:num_actual_tokens],
-                value[:num_actual_tokens],
-                output[:num_actual_tokens],
-                attn_metadata,
-                layer,
-            )
 
         num_actual_tokens = attn_metadata.num_actual_tokens
 
@@ -432,8 +435,6 @@ class TritonAttentionKeqVImpl(TritonAttentionImpl):
         (it will be overwritten by the reconstruction kernel anyway, but this
         keeps the scatter write simple using the existing combined kernel).
         """
-        if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
-            return
 
         if self._is_per_token_head_quant or is_quantized_kv_cache(self.kv_cache_dtype):
             raise NotImplementedError(
