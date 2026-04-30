@@ -206,22 +206,6 @@ class TritonAttentionKeqVBackend(TritonAttentionBackend):
     def get_name() -> str:
         return "TRITON_ATTN_KEQV"
 
-    @classmethod
-    def supports_sink(cls) -> bool:
-        # Sinks are passed through to unified_attention and should work
-        # (reconstruction kernel processes all positions), but untested.
-        return False
-
-    @classmethod
-    def supports_mm_prefix(cls) -> bool:
-        # MM prefix is passed through to unified_attention and should work
-        # (reconstruction kernel is agnostic to it), but untested.
-        return False
-
-    @classmethod
-    def supports_attn_type(cls, attn_type: str) -> bool:
-        return attn_type == AttentionType.DECODER
-
     @staticmethod
     def get_impl_cls() -> type["TritonAttentionKeqVImpl"]:
         return TritonAttentionKeqVImpl
@@ -255,6 +239,22 @@ class TritonAttentionKeqVBackend(TritonAttentionBackend):
             return (0, 2, 1, 3)
         else:
             raise ValueError(f"Unknown cache layout: {cache_layout}")
+
+    @classmethod
+    def supports_mm_prefix(cls) -> bool:
+        # MM prefix is passed through to unified_attention and should work
+        # (reconstruction kernel is agnostic to it), but untested.
+        return False
+
+    @classmethod
+    def supports_sink(cls) -> bool:
+        # Sinks are passed through to unified_attention and should work
+        # (reconstruction kernel processes all positions), but untested.
+        return False
+
+    @classmethod
+    def supports_attn_type(cls, attn_type: str) -> bool:
+        return attn_type == AttentionType.DECODER
 
 
 class TritonAttentionKeqVImpl(TritonAttentionImpl):
