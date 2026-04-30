@@ -275,7 +275,7 @@ class TritonAttentionKeqVImpl(TritonAttentionImpl):
         self._k_norm_weight: torch.Tensor | None = None
         self._rotary_emb: torch.nn.Module | None = None
 
-    def set_kraw_params(
+    def set_k_raw_params(
         self,
         k_norm_weight: torch.Tensor,
         rotary_emb: torch.nn.Module,
@@ -356,7 +356,7 @@ class TritonAttentionKeqVImpl(TritonAttentionImpl):
         k_scratch = self._get_k_scratch(kv_cache)
 
         assert self._rotary_emb is not None, (
-            "set_kraw_params must be called before forward"
+            "set_k_raw_params must be called before forward"
         )
         assert self._k_norm_weight is not None
 
@@ -426,7 +426,7 @@ class TritonAttentionKeqVImpl(TritonAttentionImpl):
         kv_cache: torch.Tensor,
         slot_mapping: torch.Tensor,
     ):
-        """Write V to the persistent cache.  K is reconstructed at attention time.
+        """Write V to the persistent cache. K is reconstructed at attention time.
 
         We still write K to the scratch buffer here for the current tokens
         (it will be overwritten by the reconstruction kernel anyway, but this
@@ -445,8 +445,8 @@ class TritonAttentionKeqVImpl(TritonAttentionImpl):
         triton_reshape_and_cache_flash(
             key,
             value,
-            k_scratch,
-            kv_cache,
+            k_scratch,  # key_cache is just a buffer (reconstructed at runtime)
+            kv_cache,  # value_cache is the only thing stored in kv_cache
             slot_mapping,
             self.kv_cache_dtype,
             layer._k_scale,

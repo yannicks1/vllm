@@ -536,7 +536,7 @@ class Gemma4Attention(nn.Module):
             )
 
             if isinstance(self.attn.impl, TritonAttentionKeqVImpl):
-                self.attn.impl.set_kraw_params(
+                self.attn.impl.set_k_raw_params(
                     k_norm_weight=self.k_norm.weight,
                     rotary_emb=self.rotary_emb,
                 )
