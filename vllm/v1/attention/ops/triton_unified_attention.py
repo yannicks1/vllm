@@ -140,6 +140,14 @@ def kernel_unified_attention(
     # over ``SLIDING_WINDOW`` inside the helpers.  ``-1`` disables.
     CHUNK_LOOKBACK: tl.constexpr = -1,
     CHUNK_SIZE: tl.constexpr = -1,
+    # Online RoPE for k_eq_v layers (Gemma4 global attention).
+    # When IS_KEQV=True, key_cache_ptr holds V; K is reconstructed inline
+    # via K = NeoX_RoPE(V * k_norm_weight).
+    IS_KEQV: tl.constexpr = False,
+    HALF_HEAD: tl.constexpr = 0,
+    k_norm_weight_ptr=None,
+    cos_sin_cache_ptr=None,
+    cos_sin_stride: tl.int64 = 0,
 ):
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = KV_QUANT_MODE >= 2
 
@@ -174,22 +182,46 @@ def kernel_unified_attention(
 
     query_offset_0 = cur_batch_in_all_start_index + query_pos
     query_offset_1 = kv_head_idx * num_queries_per_kv + offs_m % num_queries_per_kv
-    query_offset = (
-        query_offset_0[:, None] * query_stride_0
-        + query_offset_1[:, None] * query_stride_1
-        + offs_d[None, :]
-    )
 
     dim_mask = tl.where(offs_d < HEAD_SIZE, 1, 0).to(tl.int1)
     query_mask_0 = tl.where(query_pos < cur_batch_query_len, 1, 0).to(tl.int1)
     query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
+    qmask = query_mask_0[:, None] & query_mask_1[:, None]
 
-    # Q : (BLOCK_M, HEAD_SIZE_PADDED)
-    Q = tl.load(
-        query_ptr + query_offset,
-        mask=dim_mask[None, :] & query_mask_0[:, None] & query_mask_1[:, None],
-        other=0.0,
-    )
+    if IS_KEQV:
+        offs_half = tl.arange(0, HALF_HEAD)
+
+        # Q in two halves for split dot product: (BLOCK_M, HALF_HEAD) each
+        q_base = (
+            query_offset_0[:, None] * query_stride_0
+            + query_offset_1[:, None] * query_stride_1
+        )
+        Q_first = tl.load(
+            query_ptr + q_base + offs_half[None, :],
+            mask=qmask,
+            other=0.0,
+        )
+        Q_second = tl.load(
+            query_ptr + q_base + (HALF_HEAD + offs_half)[None, :],
+            mask=qmask,
+            other=0.0,
+        )
+
+        # k_norm_weight halves (constant across tile loop)
+        w_first = tl.load(k_norm_weight_ptr + offs_half).to(tl.float32)
+        w_second = tl.load(k_norm_weight_ptr + HALF_HEAD + offs_half).to(tl.float32)
+    else:
+        query_offset = (
+            query_offset_0[:, None] * query_stride_0
+            + query_offset_1[:, None] * query_stride_1
+            + offs_d[None, :]
+        )
+        # Q : (BLOCK_M, HEAD_SIZE_PADDED)
+        Q = tl.load(
+            query_ptr + query_offset,
+            mask=dim_mask[None, :] & qmask,
+            other=0.0,
+        )
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -237,38 +269,96 @@ def kernel_unified_attention(
             block_tables_ptr + block_table_offset + seq_offset // BLOCK_SIZE
         ).to(tl.int64)
 
-        v_offset = (
-            physical_block_idx[:, None] * stride_v_cache_0
-            + kv_head_idx * stride_v_cache_2
-            + offs_d[None, :] * stride_v_cache_3
-            + (seq_offset % BLOCK_SIZE)[:, None] * stride_v_cache_1
-        )
-        k_offset = (
-            physical_block_idx[None, :] * stride_k_cache_0
-            + kv_head_idx * stride_k_cache_2
-            + offs_d[:, None] * stride_k_cache_3
-            + (seq_offset % BLOCK_SIZE)[None, :] * stride_k_cache_1
-        )
-        # K : (HEAD_SIZE, TILE_SIZE)
-        K_load = tl.load(
-            key_cache_ptr + k_offset,
-            mask=dim_mask[:, None] & tile_mask[None, :],
-            other=0.0,
-        )
-        K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
-        # V : (TILE_SIZE, HEAD_SIZE)
-        V_load = tl.load(
-            value_cache_ptr + v_offset,
-            mask=dim_mask[None, :] & tile_mask[:, None],
-            other=0.0,
-        )
-        V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
+        slot_in_block = seq_offset % BLOCK_SIZE
+
+        if IS_KEQV:
+            # --- Online RoPE: reconstruct K from V inline ---
+            # Load V (stored as "key" cache) in two halves, transposed
+            # layout for dot product: (HALF_HEAD, TILE_SIZE) each.
+            k_base = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + slot_in_block[None, :] * stride_k_cache_1
+            )
+            K_first_raw = tl.load(
+                key_cache_ptr + k_base + offs_half[:, None] * stride_k_cache_3,
+                mask=tile_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+            K_second_raw = tl.load(
+                key_cache_ptr
+                + k_base
+                + (HALF_HEAD + offs_half)[:, None] * stride_k_cache_3,
+                mask=tile_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+
+            # Apply k_norm_weight
+            Kp_first = K_first_raw * w_first[:, None]
+            Kp_second = K_second_raw * w_second[:, None]
+
+            # Load cos/sin for tile positions: (HALF_HEAD, TILE_SIZE)
+            cs_base = seq_offset[None, :] * cos_sin_stride
+            cos_vals = tl.load(
+                cos_sin_cache_ptr + cs_base + offs_half[:, None],
+                mask=tile_mask[None, :],
+                other=1.0,
+            ).to(tl.float32)
+            sin_vals = tl.load(
+                cos_sin_cache_ptr + cs_base + (HALF_HEAD + offs_half)[:, None],
+                mask=tile_mask[None, :],
+                other=0.0,
+            ).to(tl.float32)
+
+            # NeoX rotation
+            K_first = Kp_first * cos_vals - Kp_second * sin_vals
+            K_second = Kp_second * cos_vals + Kp_first * sin_vals
+
+            # V : (TILE_SIZE, HEAD_SIZE_PADDED) — loaded normally
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + slot_in_block[:, None] * stride_v_cache_1
+            )
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :] & tile_mask[:, None],
+                other=0.0,
+            )
+            V = V_load.to(Q_first.dtype)
+        else:
+            # --- Standard path ---
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + slot_in_block[:, None] * stride_v_cache_1
+            )
+            k_offset = (
+                physical_block_idx[None, :] * stride_k_cache_0
+                + kv_head_idx * stride_k_cache_2
+                + offs_d[:, None] * stride_k_cache_3
+                + slot_in_block[None, :] * stride_k_cache_1
+            )
+            K_load = tl.load(
+                key_cache_ptr + k_offset,
+                mask=dim_mask[:, None] & tile_mask[None, :],
+                other=0.0,
+            )
+            K = _cast_kv_tile(K_load, Q, k_scale, KV_QUANT_MODE)
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :] & tile_mask[:, None],
+                other=0.0,
+            )
+            V = _cast_kv_tile(V_load, Q, v_scale, KV_QUANT_MODE)
 
         # Per-(token, head) scales for INT8 / FP8 per-token-head modes.
         if USE_PER_TOKEN_HEAD_SCALES:
             scale_idx = (
                 physical_block_idx * stride_ks_blk
-                + (seq_offset % BLOCK_SIZE) * stride_ks_slot
+                + slot_in_block * stride_ks_slot
                 + kv_head_idx * stride_ks_head
             )
             k_token_head_scales = tl.load(
@@ -276,7 +366,7 @@ def kernel_unified_attention(
             )
             v_scale_idx = (
                 physical_block_idx * stride_vs_blk
-                + (seq_offset % BLOCK_SIZE) * stride_vs_slot
+                + slot_in_block * stride_vs_slot
                 + kv_head_idx * stride_vs_head
             )
             v_token_head_scales = tl.load(
@@ -298,9 +388,12 @@ def kernel_unified_attention(
 
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
-        if USE_PER_TOKEN_HEAD_SCALES:
-            # Per-token-head quant: fuse softmax_scale with per-head k_scale
-            # to avoid a separate BLOCK_M × TILE_SIZE multiply on S.
+        if IS_KEQV:
+            S += scale * (
+                tl.dot(Q_first, K_first.to(Q_first.dtype))
+                + tl.dot(Q_second, K_second.to(Q_second.dtype))
+            )
+        elif USE_PER_TOKEN_HEAD_SCALES:
             S += tl.dot(Q, K) * (scale * k_token_head_scales[None, :])
         else:
             S += scale * tl.dot(Q, K)
@@ -538,6 +631,10 @@ def unified_attention(
     v_scale_cache=None,  # [num_blocks, block_size, num_kv_heads] float32
     # Chunked attention: restrict attention to aligned blocks with lookback.
     chunk_lookback=-1,
+    # Online RoPE for k_eq_v (Gemma4 global attention).
+    # When provided, K is reconstructed inline from the V cache.
+    k_norm_weight=None,  # [head_size] float — k_norm learnable weight
+    cos_sin_cache=None,  # [max_pos, head_size] — precomputed cos/sin
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -567,6 +664,7 @@ def unified_attention(
 
     use_alibi_slopes = alibi_slopes is not None
     use_qq_bias = qq_bias is not None
+    is_keqv = k_norm_weight is not None and cos_sin_cache is not None
 
     block_size = v.shape[1]
     num_seqs = len(seqused_k)
@@ -574,6 +672,7 @@ def unified_attention(
     num_kv_heads = k.shape[2]
     num_queries_per_kv = num_query_heads // num_kv_heads
     head_size = q.shape[2]
+    half_head = head_size // 2
 
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
@@ -723,6 +822,11 @@ def unified_attention(
         KV_QUANT_MODE=kv_quant_mode,
         CHUNK_LOOKBACK=chunk_lookback,
         CHUNK_SIZE=chunk_size,
+        IS_KEQV=is_keqv,
+        HALF_HEAD=half_head,
+        k_norm_weight_ptr=k_norm_weight if k_norm_weight is not None else k,
+        cos_sin_cache_ptr=cos_sin_cache if cos_sin_cache is not None else k,
+        cos_sin_stride=(cos_sin_cache.stride(0) if cos_sin_cache is not None else 0),
     )
 
     if use_3d:
