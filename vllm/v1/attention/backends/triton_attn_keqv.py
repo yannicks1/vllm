@@ -209,6 +209,7 @@ class TritonAttentionKeqVImpl(TritonAttentionImpl):
             chunk_lookback=self.chunk_lookback,
             k_norm_weight=self._k_norm_weight,
             cos_sin_cache=cos_sin_cache,
+            rotary_pairs=self._rotary_emb.rope_angles,
         )
 
         return output

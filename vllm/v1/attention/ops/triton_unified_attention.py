@@ -145,6 +145,7 @@ def kernel_unified_attention(
     # via K = NeoX_RoPE(V * k_norm_weight).
     IS_KEQV: tl.constexpr = False,
     HALF_HEAD: tl.constexpr = 0,
+    ROTARY_PAIRS: tl.constexpr = 0,
     k_norm_weight_ptr=None,
     cos_sin_cache_ptr=None,
     cos_sin_stride: tl.int64 = 0,
@@ -208,8 +209,8 @@ def kernel_unified_attention(
         )
 
         # k_norm_weight halves (constant across tile loop)
-        w_first = tl.load(k_norm_weight_ptr + offs_half).to(tl.float32)
-        w_second = tl.load(k_norm_weight_ptr + HALF_HEAD + offs_half).to(tl.float32)
+        w_first = tl.load(k_norm_weight_ptr + offs_half)
+        w_second = tl.load(k_norm_weight_ptr + HALF_HEAD + offs_half)
     else:
         query_offset = (
             query_offset_0[:, None] * query_stride_0
@@ -284,31 +285,35 @@ def kernel_unified_attention(
                 key_cache_ptr + k_base + offs_half[:, None] * stride_k_cache_3,
                 mask=tile_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
+            )
             K_second_raw = tl.load(
                 key_cache_ptr
                 + k_base
                 + (HALF_HEAD + offs_half)[:, None] * stride_k_cache_3,
                 mask=tile_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
+            )
 
             # Apply k_norm_weight
             Kp_first = K_first_raw * w_first[:, None]
             Kp_second = K_second_raw * w_second[:, None]
 
             # Load cos/sin for tile positions: (HALF_HEAD, TILE_SIZE)
+            # Only load for rotary dims (ROTARY_PAIRS); non-rotary dims
+            # get identity values (cos=1, sin=0) via the `other` param,
+            # and the GPU skips memory transactions for predicated-off lanes.
             cs_base = seq_offset[None, :] * cos_sin_stride
+            rot_mask = offs_half[:, None] < ROTARY_PAIRS
             cos_vals = tl.load(
                 cos_sin_cache_ptr + cs_base + offs_half[:, None],
-                mask=tile_mask[None, :],
+                mask=rot_mask & tile_mask[None, :],
                 other=1.0,
-            ).to(tl.float32)
+            )
             sin_vals = tl.load(
                 cos_sin_cache_ptr + cs_base + (HALF_HEAD + offs_half)[:, None],
-                mask=tile_mask[None, :],
+                mask=rot_mask & tile_mask[None, :],
                 other=0.0,
-            ).to(tl.float32)
+            )
 
             # NeoX rotation
             K_first = Kp_first * cos_vals - Kp_second * sin_vals
@@ -389,10 +394,7 @@ def kernel_unified_attention(
         # S : (BLOCK_M, TILE_SIZE)
         S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
         if IS_KEQV:
-            S += scale * (
-                tl.dot(Q_first, K_first.to(Q_first.dtype))
-                + tl.dot(Q_second, K_second.to(Q_second.dtype))
-            )
+            S += scale * (tl.dot(Q_first, K_first) + tl.dot(Q_second, K_second))
         elif USE_PER_TOKEN_HEAD_SCALES:
             S += tl.dot(Q, K) * (scale * k_token_head_scales[None, :])
         else:
@@ -635,6 +637,7 @@ def unified_attention(
     # When provided, K is reconstructed inline from the V cache.
     k_norm_weight=None,  # [head_size] float — k_norm learnable weight
     cos_sin_cache=None,  # [max_pos, head_size] — precomputed cos/sin
+    rotary_pairs=0,  # int — number of actually-rotated dim pairs per half
 ):
     assert causal, "Only causal attention is supported"
     assert q_descale is None, "Q scales not supported"
@@ -824,6 +827,7 @@ def unified_attention(
         CHUNK_SIZE=chunk_size,
         IS_KEQV=is_keqv,
         HALF_HEAD=half_head,
+        ROTARY_PAIRS=rotary_pairs if is_keqv else 0,
         k_norm_weight_ptr=k_norm_weight if k_norm_weight is not None else k,
         cos_sin_cache_ptr=cos_sin_cache if cos_sin_cache is not None else k,
         cos_sin_stride=(cos_sin_cache.stride(0) if cos_sin_cache is not None else 0),
