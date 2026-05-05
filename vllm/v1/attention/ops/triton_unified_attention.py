@@ -682,6 +682,18 @@ def unified_attention(
     )
     BLOCK_Q = BLOCK_M // num_queries_per_kv
 
+    # KEQV layers do K reconstruction per CTA; at the default BLOCK_Q this
+    # cost is paid per-query-token, which dominates prefill kernel time.
+    # Amortize by enlarging BLOCK_M (and thus BLOCK_Q) on mixed/prefill
+    # batches. Gated on VLLM_KEQV_PREFILL_BLOCK_M for tuning.
+    if is_keqv and max_seqlen_q > 1:
+        import os as _os
+
+        _override = int(_os.environ.get("VLLM_KEQV_PREFILL_BLOCK_M", "0"))
+        if _override > BLOCK_M:
+            BLOCK_M = _override
+            BLOCK_Q = BLOCK_M // num_queries_per_kv
+
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
     # However, it is slow to realize the query_lens on cpu.
