@@ -273,26 +273,32 @@ def kernel_unified_attention(
         slot_in_block = seq_offset % BLOCK_SIZE
 
         if IS_KEQV:
-            # --- Online RoPE: reconstruct K from V inline ---
-            # Load V (stored as "key" cache) in two halves, transposed
-            # layout for dot product: (HALF_HEAD, TILE_SIZE) each.
-            k_base = (
-                physical_block_idx[None, :] * stride_k_cache_0
-                + kv_head_idx * stride_k_cache_2
-                + slot_in_block[None, :] * stride_k_cache_1
+            # --- Single V-cache load, used for both K reconstruction and P@V ---
+            # k_eq_v means the raw stored V equals what K would be pre-norm/
+            # pre-rope, so one HBM load covers both tensors. We load V in the
+            # natural P@V layout, then derive the (HALF_HEAD, TILE_SIZE) halves
+            # needed for the NeoX rotation via in-register reshape+split.
+            v_offset = (
+                physical_block_idx[:, None] * stride_v_cache_0
+                + kv_head_idx * stride_v_cache_2
+                + offs_d[None, :] * stride_v_cache_3
+                + slot_in_block[:, None] * stride_v_cache_1
             )
-            K_first_raw = tl.load(
-                key_cache_ptr + k_base + offs_half[:, None] * stride_k_cache_3,
-                mask=tile_mask[None, :],
+            V_load = tl.load(
+                value_cache_ptr + v_offset,
+                mask=dim_mask[None, :] & tile_mask[:, None],
                 other=0.0,
             )
-            K_second_raw = tl.load(
-                key_cache_ptr
-                + k_base
-                + (HALF_HEAD + offs_half)[:, None] * stride_k_cache_3,
-                mask=tile_mask[None, :],
-                other=0.0,
-            )
+
+            # V_load: (TILE_SIZE, HEAD_SIZE_PADDED) with dim axis laid out as
+            #         [first_half (HALF_HEAD) | second_half (HALF_HEAD)].
+            # Reshape (T, 2*HH) → (T, 2, HH); permute to put the halves axis
+            # last; split. Each piece is (T, HH); tl.trans gives (HH, T).
+            V_reshaped = tl.reshape(V_load, (TILE_SIZE, 2, HALF_HEAD))
+            V_perm = tl.trans(V_reshaped, (0, 2, 1))  # (T, HH, 2)
+            V_first_T, V_second_T = tl.split(V_perm)
+            K_first_raw = tl.trans(V_first_T)
+            K_second_raw = tl.trans(V_second_T)
 
             # Apply k_norm_weight
             Kp_first = K_first_raw * w_first[:, None]
@@ -319,18 +325,7 @@ def kernel_unified_attention(
             K_first = Kp_first * cos_vals - Kp_second * sin_vals
             K_second = Kp_second * cos_vals + Kp_first * sin_vals
 
-            # V : (TILE_SIZE, HEAD_SIZE_PADDED) — loaded normally
-            v_offset = (
-                physical_block_idx[:, None] * stride_v_cache_0
-                + kv_head_idx * stride_v_cache_2
-                + offs_d[None, :] * stride_v_cache_3
-                + slot_in_block[:, None] * stride_v_cache_1
-            )
-            V_load = tl.load(
-                value_cache_ptr + v_offset,
-                mask=dim_mask[None, :] & tile_mask[:, None],
-                other=0.0,
-            )
+            # V reused from the initial load for the P@V matmul.
             V = V_load.to(Q_first.dtype)
         else:
             # --- Standard path ---
