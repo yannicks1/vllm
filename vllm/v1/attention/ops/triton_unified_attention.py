@@ -682,16 +682,21 @@ def unified_attention(
     )
     BLOCK_Q = BLOCK_M // num_queries_per_kv
 
-    # KEQV layers do K reconstruction per CTA; at the default BLOCK_Q this
-    # cost is paid per-query-token, which dominates prefill kernel time.
-    # Amortize by enlarging BLOCK_M (and thus BLOCK_Q) on mixed/prefill
-    # batches. Gated on VLLM_KEQV_PREFILL_BLOCK_M for tuning.
+    # KEQV layers do K reconstruction per CTA; at the default BLOCK_Q the
+    # reconstruction cost is paid per-query-token and dominates prefill
+    # kernel time. Enlarging BLOCK_M amortizes reconstruction across more
+    # query rows per CTA, bounded by per-CTA register pressure.
+    # BLOCK_M=32 was measured as the knee on H100 (head_size=512); larger
+    # values regress from register pressure. Override with
+    # VLLM_KEQV_PREFILL_BLOCK_M when tuning a different device.
     if is_keqv and max_seqlen_q > 1:
         import os as _os
 
-        _override = int(_os.environ.get("VLLM_KEQV_PREFILL_BLOCK_M", "0"))
-        if _override > BLOCK_M:
-            BLOCK_M = _override
+        target_bm = int(_os.environ.get("VLLM_KEQV_PREFILL_BLOCK_M", "32"))
+        # Only activate once the chunk has enough query tokens to fill the
+        # larger tile; tiny trailing chunks stay at the default.
+        if target_bm > BLOCK_M and max_seqlen_q * num_queries_per_kv >= target_bm:
+            BLOCK_M = target_bm
             BLOCK_Q = BLOCK_M // num_queries_per_kv
 
     # Ideally we would launch with kernel with:
