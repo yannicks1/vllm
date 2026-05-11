@@ -7,7 +7,6 @@
 #  - Chih-Chieh Yang <chih.chieh.yang@ibm.com>
 #  - Thomas Parnell <tpa@zurich.ibm.com>
 
-import os
 from typing import Any
 
 import torch
@@ -593,41 +592,6 @@ def _get_tile_size(
     return 16 if element_size >= 2 else 32
 
 
-def _get_keqv_prefill_config(head_size: int) -> tuple[int, int, int]:
-    """Pick (BLOCK_M, num_warps, num_stages) for the KEQV prefill kernel.
-
-    KEQV attention does K reconstruction per tile; the per-CTA register
-    footprint scales with BLOCK_M x head_size. At Triton's default
-    num_warps=4, BLOCK_M=64 spills on Hopper with Gemma4-scale heads
-    (head_size=512). Measured knee on H100: BLOCK_M=64 + num_warps=8 —
-    the extra warps spread the register load across enough threads to
-    fit the budget without spills.
-
-    Compute capabilities outside the measured family fall back to
-    (0, 0, 0), meaning "use the caller's BLOCK_M and Triton's default
-    launch config" — this preserves pre-optimization behavior on
-    untested hardware.
-
-    Env overrides (taken unconditionally when set to a positive value):
-        VLLM_KEQV_PREFILL_BLOCK_M
-        VLLM_KEQV_PREFILL_NUM_WARPS
-        VLLM_KEQV_PREFILL_NUM_STAGES
-    """
-    block_m = int(os.environ.get("VLLM_KEQV_PREFILL_BLOCK_M", "0"))
-    num_warps = int(os.environ.get("VLLM_KEQV_PREFILL_NUM_WARPS", "0"))
-    num_stages = int(os.environ.get("VLLM_KEQV_PREFILL_NUM_STAGES", "0"))
-    if block_m or num_warps or num_stages:
-        return block_m, num_warps, num_stages
-
-    # Hopper (SM_90) + large head — e.g. Gemma4-31B global layers.
-    if current_platform.is_cuda() and current_platform.is_device_capability_family(
-        90
-    ) and head_size >= 256:
-        return 64, 8, 0
-
-    return 0, 0, 0
-
-
 def unified_attention(
     q,
     k,
@@ -713,25 +677,22 @@ def unified_attention(
     )
     BLOCK_Q = BLOCK_M // num_queries_per_kv
 
-    # KEQV prefill has extra per-CTA work (K reconstruction + RoPE) on top of
-    # the standard attention path. Tuning BLOCK_M/num_warps/num_stages for
-    # this regime is device-specific; _get_keqv_prefill_config centralizes
-    # the measured knee and the env-var overrides. Leaving launch_kwargs
-    # empty means Triton's defaults apply (pre-optimization behavior).
-    launch_kwargs: dict[str, int] = {}
+    # KEQV layers do K reconstruction per CTA; at the default BLOCK_Q the
+    # reconstruction cost is paid per-query-token and dominates prefill
+    # kernel time. Enlarging BLOCK_M amortizes reconstruction across more
+    # query rows per CTA, bounded by per-CTA register pressure.
+    # BLOCK_M=32 was measured as the knee on H100 (head_size=512); larger
+    # values regress from register pressure. Override with
+    # VLLM_KEQV_PREFILL_BLOCK_M when tuning a different device.
     if is_keqv and max_seqlen_q > 1:
-        target_bm, target_nw, target_ns = _get_keqv_prefill_config(head_size)
-        # Only bump BLOCK_M when the chunk has enough query rows to fill the
-        # larger tile; tiny trailing chunks stay at the default. The launch
-        # config overrides (num_warps/num_stages) were measured for the
-        # bumped BLOCK_M, so only apply them if we actually bumped it.
+        import os as _os
+
+        target_bm = int(_os.environ.get("VLLM_KEQV_PREFILL_BLOCK_M", "32"))
+        # Only activate once the chunk has enough query tokens to fill the
+        # larger tile; tiny trailing chunks stay at the default.
         if target_bm > BLOCK_M and max_seqlen_q * num_queries_per_kv >= target_bm:
             BLOCK_M = target_bm
             BLOCK_Q = BLOCK_M // num_queries_per_kv
-            if target_nw > 0:
-                launch_kwargs["num_warps"] = target_nw
-            if target_ns > 0:
-                launch_kwargs["num_stages"] = target_ns
 
     # Ideally we would launch with kernel with:
     # \sum_i[ceil(query_len[i] / BLOCK_Q)] blocks.
@@ -882,7 +843,6 @@ def unified_attention(
         k_norm_weight_ptr=k_norm_weight if k_norm_weight is not None else k,
         cos_sin_cache_ptr=cos_sin_cache if cos_sin_cache is not None else k,
         cos_sin_stride=(cos_sin_cache.stride(0) if cos_sin_cache is not None else 0),
-        **launch_kwargs,
     )
 
     if use_3d:
