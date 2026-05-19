@@ -158,6 +158,14 @@ def kernel_unified_attention(
     # for kernel-cost decomposition only.
     KEQV_DISABLE_KNORM: tl.constexpr = False,
     KEQV_DISABLE_ROPE: tl.constexpr = False,
+    # Decode-only optimization: instead of loading V once in (T, H) layout
+    # and deriving K halves via reshape/permute/split (warp-shuffle data
+    # movement), issue two extra strided loads of the same V cache to
+    # produce K_first_raw / K_second_raw directly in matmul-ready (HH, T)
+    # layout. Tripled per-tile HBM transactions on the V cache; mostly
+    # absorbed by L2 at decode but blows past L2 capacity at long-context
+    # prefill — gated to max_seqlen_q == 1.
+    KEQV_MULTI_LOAD: tl.constexpr = False,
 ):
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = KV_QUANT_MODE >= 2
 
@@ -269,11 +277,7 @@ def kernel_unified_attention(
         slot_in_block = seq_offset % BLOCK_SIZE
 
         if IS_KEQV:
-            # --- Single V-cache load, used for both K reconstruction and P@V ---
-            # k_eq_v means the raw stored V equals what K would be pre-norm/
-            # pre-rope, so one HBM load covers both tensors. We load V in the
-            # natural P@V layout, then derive the (HALF_HEAD, TILE_SIZE) halves
-            # needed for the NeoX rotation via in-register reshape+split.
+            # V load (T, H) for P@V — always present.
             v_offset = (
                 physical_block_idx[:, None] * stride_v_cache_0
                 + kv_head_idx * stride_v_cache_2
@@ -286,15 +290,38 @@ def kernel_unified_attention(
                 other=0.0,
             )
 
-            # V_load: (TILE_SIZE, HEAD_SIZE_PADDED) with dim axis laid out as
-            #         [first_half (HALF_HEAD) | second_half (HALF_HEAD)].
-            # Reshape (T, 2*HH) → (T, 2, HH); permute directly to the matmul-
-            # ready axis order (HH, T, 2); split the size-2 dim to produce
-            # both halves already in (HH, T). One trans replaces the prior
-            # `(0, 2, 1)` permute + two final 2D transposes.
-            V_reshaped = tl.reshape(V_load, (TILE_SIZE, 2, HALF_HEAD))
-            V_perm = tl.trans(V_reshaped, (2, 0, 1))  # (HH, T, 2)
-            K_first_raw, K_second_raw = tl.split(V_perm)  # each (HH, T)
+            if KEQV_MULTI_LOAD:
+                # Decode path: two extra strided loads of the same V cache,
+                # producing K halves directly in (HH, T) matmul-ready
+                # layout. Avoids the in-register V→halves reshape/permute/
+                # split chain (warp-shuffle data movement). Tripled per-
+                # tile HBM transactions, but absorbed by L2 at decode's
+                # small per-call working set. Gated off for prefill where
+                # the L2 budget is exceeded.
+                k_first_offset = (
+                    physical_block_idx[None, :] * stride_v_cache_0
+                    + kv_head_idx * stride_v_cache_2
+                    + offs_half[:, None] * stride_v_cache_3
+                    + slot_in_block[None, :] * stride_v_cache_1
+                )
+                K_first_raw = tl.load(
+                    value_cache_ptr + k_first_offset,
+                    mask=tile_mask[None, :],
+                    other=0.0,
+                )
+                K_second_raw = tl.load(
+                    value_cache_ptr + k_first_offset
+                    + HALF_HEAD * stride_v_cache_3,
+                    mask=tile_mask[None, :],
+                    other=0.0,
+                )
+            else:
+                # Prefill path: derive K halves from V_load via in-register
+                # reshape/permute/split. Reshape (T, 2*HH) → (T, 2, HH);
+                # permute to (HH, T, 2); split the size-2 dim.
+                V_reshaped = tl.reshape(V_load, (TILE_SIZE, 2, HALF_HEAD))
+                V_perm = tl.trans(V_reshaped, (2, 0, 1))  # (HH, T, 2)
+                K_first_raw, K_second_raw = tl.split(V_perm)
 
             # Apply k_norm_weight (skipped when KEQV_DISABLE_KNORM).
             if KEQV_DISABLE_KNORM:
@@ -688,6 +715,14 @@ def unified_attention(
 
     keqv_disable_knorm = is_keqv and _os.environ.get("VLLM_KEQV_DISABLE_KNORM") == "1"
     keqv_disable_rope = is_keqv and _os.environ.get("VLLM_KEQV_DISABLE_ROPE") == "1"
+    # Multi-load V-cache for K halves: decode-only. At max_seqlen_q == 1 the
+    # per-call HBM working set is small enough that L2 absorbs the duplicate
+    # V reads; at prefill the L2 budget is exceeded and the in-register
+    # V→halves derivation wins. Override with VLLM_KEQV_MULTI_LOAD={0,1}.
+    keqv_multi_load = is_keqv and max_seqlen_q == 1
+    _ml_override = _os.environ.get("VLLM_KEQV_MULTI_LOAD")
+    if _ml_override is not None:
+        keqv_multi_load = is_keqv and _ml_override == "1"
 
     block_size = v.shape[1]
     num_seqs = len(seqused_k)
@@ -870,6 +905,7 @@ def unified_attention(
         cos_sin_stride=(cos_sin_cache.stride(0) if cos_sin_cache is not None else 0),
         KEQV_DISABLE_KNORM=keqv_disable_knorm,
         KEQV_DISABLE_ROPE=keqv_disable_rope,
+        KEQV_MULTI_LOAD=keqv_multi_load,
     )
 
     if use_3d:
