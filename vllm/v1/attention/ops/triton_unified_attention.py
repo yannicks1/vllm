@@ -158,16 +158,6 @@ def kernel_unified_attention(
     # for kernel-cost decomposition only.
     KEQV_DISABLE_KNORM: tl.constexpr = False,
     KEQV_DISABLE_ROPE: tl.constexpr = False,
-    # When True, the cos_sin_cache_ptr points to a pre-fused cache of shape
-    # (max_pos, 2 * head_size) with k_norm absorbed into cos/sin. Per row
-    # layout: [wf_cos | wf_sin | ws_cos | ws_sin], each HALF_HEAD wide,
-    # where wf = k_norm_weight[:HALF_HEAD], ws = k_norm_weight[HALF_HEAD:].
-    # The kernel then computes:
-    #     K_first  = K_raw_first  * wf_cos - K_raw_second * ws_sin
-    #     K_second = K_raw_second * ws_cos + K_raw_first  * wf_sin
-    # No separate k_norm multiply is performed. cos_sin_stride must be
-    # set to 2 * head_size (the row stride of the fused cache).
-    KEQV_KNORM_FUSED: tl.constexpr = False,
 ):
     USE_PER_TOKEN_HEAD_SCALES: tl.constexpr = KV_QUANT_MODE >= 2
 
@@ -225,9 +215,8 @@ def kernel_unified_attention(
     if IS_KEQV:
         offs_half = tl.arange(0, HALF_HEAD)
         # k_norm_weight halves (constant across tile loop). Skip the load
-        # entirely when the multiply is disabled or absorbed into the
-        # fused cos/sin cache.
-        if not KEQV_KNORM_FUSED and not KEQV_DISABLE_KNORM:
+        # when the multiply is disabled (profiling toggle).
+        if not KEQV_DISABLE_KNORM:
             w_first = tl.load(k_norm_weight_ptr + offs_half)
             w_second = tl.load(k_norm_weight_ptr + HALF_HEAD + offs_half)
 
@@ -307,76 +296,41 @@ def kernel_unified_attention(
             V_perm = tl.trans(V_reshaped, (2, 0, 1))  # (HH, T, 2)
             K_first_raw, K_second_raw = tl.split(V_perm)  # each (HH, T)
 
-            if KEQV_KNORM_FUSED:
-                # Fused path: k_norm absorbed into cos/sin. cache row =
-                # [wf_cos | wf_sin | ws_cos | ws_sin], each HALF_HEAD wide.
-                # cos_sin_stride is 2 * head_size = 4 * HALF_HEAD.
-                # Sin tables are zero on non-rotary lanes (since w·sin=0
-                # there), so they keep the rotary-only mask. Cos tables
-                # have w·1 = w on non-rotary lanes — non-trivial, so they
-                # need a full HALF_HEAD load.
+            # Apply k_norm_weight (skipped when KEQV_DISABLE_KNORM).
+            if KEQV_DISABLE_KNORM:
+                Kp_first = K_first_raw
+                Kp_second = K_second_raw
+            else:
+                Kp_first = K_first_raw * w_first[:, None]
+                Kp_second = K_second_raw * w_second[:, None]
+
+            if KEQV_DISABLE_ROPE:
+                # Skip cos/sin HBM load and the NeoX rotation entirely.
+                K_first = Kp_first
+                K_second = Kp_second
+            else:
+                # Load cos/sin for tile positions: (HALF_HEAD, TILE_SIZE)
+                # Only load for rotary dims (ROTARY_PAIRS); non-rotary
+                # dims get identity values (cos=1, sin=0) via `other`,
+                # and the GPU skips memory transactions for predicated-
+                # off lanes.
                 cs_base = seq_offset[None, :] * cos_sin_stride
                 rot_mask = offs_half[:, None] < ROTARY_PAIRS
-                wf_cos = tl.load(
+                cos_vals = tl.load(
                     cos_sin_cache_ptr + cs_base + offs_half[:, None],
-                    mask=tile_mask[None, :],
-                    other=0.0,
+                    mask=rot_mask & tile_mask[None, :],
+                    other=1.0,
                 )
-                wf_sin = tl.load(
-                    cos_sin_cache_ptr + cs_base + (HALF_HEAD + offs_half)[:, None],
+                sin_vals = tl.load(
+                    cos_sin_cache_ptr + cs_base
+                    + (HALF_HEAD + offs_half)[:, None],
                     mask=rot_mask & tile_mask[None, :],
                     other=0.0,
                 )
-                ws_cos = tl.load(
-                    cos_sin_cache_ptr + cs_base
-                    + (2 * HALF_HEAD + offs_half)[:, None],
-                    mask=tile_mask[None, :],
-                    other=0.0,
-                )
-                ws_sin = tl.load(
-                    cos_sin_cache_ptr + cs_base
-                    + (3 * HALF_HEAD + offs_half)[:, None],
-                    mask=rot_mask & tile_mask[None, :],
-                    other=0.0,
-                )
-                K_first = K_first_raw * wf_cos - K_second_raw * ws_sin
-                K_second = K_second_raw * ws_cos + K_first_raw * wf_sin
-            else:
-                # Apply k_norm_weight (skipped when KEQV_DISABLE_KNORM).
-                if KEQV_DISABLE_KNORM:
-                    Kp_first = K_first_raw
-                    Kp_second = K_second_raw
-                else:
-                    Kp_first = K_first_raw * w_first[:, None]
-                    Kp_second = K_second_raw * w_second[:, None]
 
-                if KEQV_DISABLE_ROPE:
-                    # Skip cos/sin HBM load and the NeoX rotation entirely.
-                    K_first = Kp_first
-                    K_second = Kp_second
-                else:
-                    # Load cos/sin for tile positions: (HALF_HEAD, TILE_SIZE)
-                    # Only load for rotary dims (ROTARY_PAIRS); non-rotary
-                    # dims get identity values (cos=1, sin=0) via `other`,
-                    # and the GPU skips memory transactions for predicated-
-                    # off lanes.
-                    cs_base = seq_offset[None, :] * cos_sin_stride
-                    rot_mask = offs_half[:, None] < ROTARY_PAIRS
-                    cos_vals = tl.load(
-                        cos_sin_cache_ptr + cs_base + offs_half[:, None],
-                        mask=rot_mask & tile_mask[None, :],
-                        other=1.0,
-                    )
-                    sin_vals = tl.load(
-                        cos_sin_cache_ptr + cs_base
-                        + (HALF_HEAD + offs_half)[:, None],
-                        mask=rot_mask & tile_mask[None, :],
-                        other=0.0,
-                    )
-
-                    # NeoX rotation
-                    K_first = Kp_first * cos_vals - Kp_second * sin_vals
-                    K_second = Kp_second * cos_vals + Kp_first * sin_vals
+                # NeoX rotation
+                K_first = Kp_first * cos_vals - Kp_second * sin_vals
+                K_second = Kp_second * cos_vals + Kp_first * sin_vals
 
             # V reused from the initial load for the P@V matmul.
             V = V_load.to(Q.dtype)
@@ -743,21 +697,6 @@ def unified_attention(
     head_size = q.shape[2]
     half_head = head_size // 2
 
-    # Fused-knorm path: detected by the cos_sin_cache trailing dim being
-    # 2*head_size (the packed [wf_cos | wf_sin | ws_cos | ws_sin] layout).
-    # Gated to decode (max_seqlen_q == 1): on prefill the +5x rope-cache
-    # HBM traffic of the fused path eats the saved compute (kernel becomes
-    # bandwidth-bound at long context). See 2026-05-19 sweep.
-    # Disable toggles take priority since they're profiling-only.
-    keqv_knorm_fused = (
-        is_keqv
-        and max_seqlen_q == 1
-        and not keqv_disable_knorm
-        and not keqv_disable_rope
-        and cos_sin_cache is not None
-        and cos_sin_cache.shape[-1] == 2 * head_size
-    )
-
     BLOCK_M = (
         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
     )
@@ -931,7 +870,6 @@ def unified_attention(
         cos_sin_stride=(cos_sin_cache.stride(0) if cos_sin_cache is not None else 0),
         KEQV_DISABLE_KNORM=keqv_disable_knorm,
         KEQV_DISABLE_ROPE=keqv_disable_rope,
-        KEQV_KNORM_FUSED=keqv_knorm_fused,
     )
 
     if use_3d:

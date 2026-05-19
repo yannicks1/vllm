@@ -34,31 +34,6 @@ from vllm.v1.attention.backends.triton_attn import (
     unified_attention,
 )
 
-
-def _build_fused_cos_sin_cache(
-    cos_sin_cache: torch.Tensor,
-    k_norm_weight: torch.Tensor,
-) -> torch.Tensor:
-    """Pre-multiply cos/sin by per-half k_norm for the fused-knorm kernel path.
-
-    cos_sin_cache: (max_pos, head_size) — first H/2 cols are cos, last H/2 sin.
-    k_norm_weight: (head_size,) — first H/2 entries are wf, last H/2 are ws.
-
-    Returns a tensor of shape (max_pos, 2 * head_size) with row layout:
-        [wf_cos (HH) | wf_sin (HH) | ws_cos (HH) | ws_sin (HH)].
-    """
-    head_size = cos_sin_cache.shape[-1]
-    half_head = head_size // 2
-    cos = cos_sin_cache[:, :half_head]  # (max_pos, HH)
-    sin = cos_sin_cache[:, half_head:]  # (max_pos, HH)
-    w_first = k_norm_weight[:half_head]  # (HH,)
-    w_second = k_norm_weight[half_head:]  # (HH,)
-    wf_cos = cos * w_first[None, :]
-    wf_sin = sin * w_first[None, :]
-    ws_cos = cos * w_second[None, :]
-    ws_sin = sin * w_second[None, :]
-    return torch.cat([wf_cos, wf_sin, ws_cos, ws_sin], dim=-1).contiguous()
-
 # --------------------------------------------------------------------------
 # Backend and Impl classes
 # --------------------------------------------------------------------------
@@ -146,32 +121,15 @@ class TritonAttentionKeqVImpl(TritonAttentionImpl):
         super().__init__(*args, **kwargs)
         self._k_norm_weight: torch.Tensor | None = None
         self._rotary_emb: torch.nn.Module | None = None
-        self._fused_cos_sin_cache: torch.Tensor | None = None
 
     def set_k_raw_params(
         self,
         k_norm_weight: torch.Tensor,
         rotary_emb: torch.nn.Module,
     ) -> None:
-        """Store k_norm_weight and rotary_emb for online K reconstruction.
-
-        When VLLM_KEQV_KNORM_FUSED=1, also precompute a per-layer fused
-        cache that absorbs k_norm into cos/sin so the kernel can skip the
-        runtime k_norm multiply. Layout per row of shape (max_pos, 2H):
-            [wf_cos (HH) | wf_sin (HH) | ws_cos (HH) | ws_sin (HH)]
-        where wf = k_norm[:HH], ws = k_norm[HH:], H = head_size, HH = H/2.
-        """
+        """Store k_norm_weight and rotary_emb for online K reconstruction."""
         self._k_norm_weight = k_norm_weight
         self._rotary_emb = rotary_emb
-
-        import os as _os
-
-        if _os.environ.get("VLLM_KEQV_KNORM_FUSED") == "1":
-            self._fused_cos_sin_cache = _build_fused_cos_sin_cache(
-                rotary_emb.cos_sin_cache, k_norm_weight
-            )
-        else:
-            self._fused_cos_sin_cache = None
 
     def forward(
         self,
@@ -210,20 +168,11 @@ class TritonAttentionKeqVImpl(TritonAttentionImpl):
         )
         assert self._k_norm_weight is not None
 
-        # Prefer the precomputed fused (k_norm-absorbed) cache when present —
-        # the kernel detects fused mode by trailing dim being 2*head_size.
-        if self._fused_cos_sin_cache is not None:
-            cos_sin_cache = self._fused_cos_sin_cache
-        else:
-            cos_sin_cache = self._rotary_emb.cos_sin_cache
+        cos_sin_cache = self._rotary_emb.cos_sin_cache
         if cos_sin_cache.dtype != kv_cache.dtype:
             cos_sin_cache = cos_sin_cache.to(dtype=kv_cache.dtype)
-            if self._fused_cos_sin_cache is not None:
-                self._fused_cos_sin_cache = cos_sin_cache  # cache the cast
         if cos_sin_cache.device != kv_cache.device:
             cos_sin_cache = cos_sin_cache.to(device=kv_cache.device)
-            if self._fused_cos_sin_cache is not None:
-                self._fused_cos_sin_cache = cos_sin_cache
 
         # Online RoPE: pass V cache as both k and v; the kernel reconstructs
         # K inline from V using k_norm_weight + cos_sin_cache.
