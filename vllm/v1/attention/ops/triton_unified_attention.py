@@ -208,43 +208,28 @@ def kernel_unified_attention(
     query_mask_1 = tl.where(query_offset_1 < num_query_heads, 1, 0).to(tl.int1)
     qmask = query_mask_0[:, None] & query_mask_1[:, None]
 
+    # Q : (BLOCK_M, HEAD_SIZE_PADDED). Loaded as full head for both keqv and
+    # standard paths — keqv reassembles K halves into a full-head K and uses
+    # a single full-head mma instead of two half-head mmas.
+    query_offset = (
+        query_offset_0[:, None] * query_stride_0
+        + query_offset_1[:, None] * query_stride_1
+        + offs_d[None, :]
+    )
+    Q = tl.load(
+        query_ptr + query_offset,
+        mask=dim_mask[None, :] & qmask,
+        other=0.0,
+    )
+
     if IS_KEQV:
         offs_half = tl.arange(0, HALF_HEAD)
-
-        # Q in two halves for split dot product: (BLOCK_M, HALF_HEAD) each
-        q_base = (
-            query_offset_0[:, None] * query_stride_0
-            + query_offset_1[:, None] * query_stride_1
-        )
-        Q_first = tl.load(
-            query_ptr + q_base + offs_half[None, :],
-            mask=qmask,
-            other=0.0,
-        )
-        Q_second = tl.load(
-            query_ptr + q_base + (HALF_HEAD + offs_half)[None, :],
-            mask=qmask,
-            other=0.0,
-        )
-
         # k_norm_weight halves (constant across tile loop). Skip the load
         # entirely when the multiply is disabled or absorbed into the
         # fused cos/sin cache.
         if not KEQV_KNORM_FUSED and not KEQV_DISABLE_KNORM:
             w_first = tl.load(k_norm_weight_ptr + offs_half)
             w_second = tl.load(k_norm_weight_ptr + HALF_HEAD + offs_half)
-    else:
-        query_offset = (
-            query_offset_0[:, None] * query_stride_0
-            + query_offset_1[:, None] * query_stride_1
-            + offs_d[None, :]
-        )
-        # Q : (BLOCK_M, HEAD_SIZE_PADDED)
-        Q = tl.load(
-            query_ptr + query_offset,
-            mask=dim_mask[None, :] & qmask,
-            other=0.0,
-        )
 
     block_table_offset = seq_idx * block_table_stride
 
@@ -314,13 +299,13 @@ def kernel_unified_attention(
 
             # V_load: (TILE_SIZE, HEAD_SIZE_PADDED) with dim axis laid out as
             #         [first_half (HALF_HEAD) | second_half (HALF_HEAD)].
-            # Reshape (T, 2*HH) → (T, 2, HH); permute to put the halves axis
-            # last; split. Each piece is (T, HH); tl.trans gives (HH, T).
+            # Reshape (T, 2*HH) → (T, 2, HH); permute directly to the matmul-
+            # ready axis order (HH, T, 2); split the size-2 dim to produce
+            # both halves already in (HH, T). One trans replaces the prior
+            # `(0, 2, 1)` permute + two final 2D transposes.
             V_reshaped = tl.reshape(V_load, (TILE_SIZE, 2, HALF_HEAD))
-            V_perm = tl.trans(V_reshaped, (0, 2, 1))  # (T, HH, 2)
-            V_first_T, V_second_T = tl.split(V_perm)
-            K_first_raw = tl.trans(V_first_T)
-            K_second_raw = tl.trans(V_second_T)
+            V_perm = tl.trans(V_reshaped, (2, 0, 1))  # (HH, T, 2)
+            K_first_raw, K_second_raw = tl.split(V_perm)  # each (HH, T)
 
             if KEQV_KNORM_FUSED:
                 # Fused path: k_norm absorbed into cos/sin. cache row =
@@ -394,7 +379,7 @@ def kernel_unified_attention(
                     K_second = Kp_second * cos_vals + Kp_first * sin_vals
 
             # V reused from the initial load for the P@V matmul.
-            V = V_load.to(Q_first.dtype)
+            V = V_load.to(Q.dtype)
         else:
             # --- Standard path ---
             v_offset = (
@@ -455,13 +440,23 @@ def kernel_unified_attention(
         )
 
         # S : (BLOCK_M, TILE_SIZE)
-        S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
         if IS_KEQV:
-            S += scale * (tl.dot(Q_first, K_first) + tl.dot(Q_second, K_second))
-        elif USE_PER_TOKEN_HEAD_SCALES:
-            S += tl.dot(Q, K) * (scale * k_token_head_scales[None, :])
+            # Reassemble K_full (HEAD_SIZE_PADDED, TILE_SIZE) from the two
+            # rotated halves and use a single full-head mma. tl.join packs
+            # along a new last dim of size 2; permute brings that "which-
+            # half" axis to the leading position; reshape collapses
+            # (2, HH, T) → (2*HH, T) — first HH rows are K_first, last HH
+            # are K_second.
+            K_joined = tl.join(K_first, K_second)  # (HH, T, 2)
+            K_perm = tl.trans(K_joined, (2, 0, 1))  # (2, HH, T)
+            K_full = tl.reshape(K_perm, (HEAD_SIZE_PADDED, TILE_SIZE))
+            S = scale * tl.dot(Q, K_full)
         else:
-            S += scale * tl.dot(Q, K)
+            S = tl.zeros(shape=(BLOCK_M, TILE_SIZE), dtype=tl.float32)
+            if USE_PER_TOKEN_HEAD_SCALES:
+                S += tl.dot(Q, K) * (scale * k_token_head_scales[None, :])
+            else:
+                S += scale * tl.dot(Q, K)
 
         if USE_SOFTCAP:
             S = apply_softcap(S, softcap)
