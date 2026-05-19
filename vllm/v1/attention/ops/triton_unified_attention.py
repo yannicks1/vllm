@@ -745,9 +745,13 @@ def unified_attention(
 
     # Fused-knorm path: detected by the cos_sin_cache trailing dim being
     # 2*head_size (the packed [wf_cos | wf_sin | ws_cos | ws_sin] layout).
+    # Gated to decode (max_seqlen_q == 1): on prefill the +5x rope-cache
+    # HBM traffic of the fused path eats the saved compute (kernel becomes
+    # bandwidth-bound at long context). See 2026-05-19 sweep.
     # Disable toggles take priority since they're profiling-only.
     keqv_knorm_fused = (
         is_keqv
+        and max_seqlen_q == 1
         and not keqv_disable_knorm
         and not keqv_disable_rope
         and cos_sin_cache is not None
