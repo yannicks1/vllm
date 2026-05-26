@@ -37,6 +37,7 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.activation import get_act_and_mul_fn
 from vllm.model_executor.layers.attention import Attention
+from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.model_executor.layers.fused_moe import (
     FusedMoE,
     GateLinear,
@@ -549,6 +550,32 @@ class Gemma4Attention(nn.Module):
         hidden_states: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        # Pipelined KEQV prefetch: launch K reconstruction for old positions
+        # on a side stream before QKV projection so HBM-bound reconstruction
+        # overlaps with compute-bound QKV matmul.
+        if self.is_kv_shared_layer:
+            from vllm.v1.attention.backends.triton_attn_keqv import (
+                TritonAttentionKeqVImpl,
+            )
+
+            if isinstance(self.attn.impl, TritonAttentionKeqVImpl):
+                try:
+                    attn_meta, _, kv_cache, _ = get_attention_context(
+                        self.attn.layer_name
+                    )
+                    if (
+                        attn_meta is not None
+                        and attn_meta.max_query_len == 1
+                        and kv_cache is not None
+                    ):
+                        self.attn.impl.launch_prefetch(
+                            kv_cache,
+                            attn_meta.block_table,
+                            attn_meta.seq_lens,
+                        )
+                except Exception:
+                    pass
+
         # Unified QKV path (works for both k_eq_v and standard layers).
         # For k_eq_v, K weights are loaded into both K and V slots of
         # qkv_proj, so V == K automatically.
@@ -797,6 +824,39 @@ class Gemma4DecoderLayer(nn.Module):
         return hidden_states, None
 
 
+def _queue_keqv_prefetch_for_next_layer(
+    decoder_layers: list,
+    next_idx: int,
+) -> None:
+    """If decoder_layers[next_idx] is a KEQV decode layer, store its pre-kernel
+    args so that the CURRENT layer's TritonAttentionKeqVImpl.forward() launches
+    the pre-kernel right after unified_attention — overlapping with o_proj+MLP."""
+    if next_idx >= len(decoder_layers):
+        return
+    next_layer = decoder_layers[next_idx]
+    if not next_layer.self_attn.is_kv_shared_layer:
+        return
+    from vllm.v1.attention.backends.triton_attn_keqv import TritonAttentionKeqVImpl
+
+    impl = next_layer.self_attn.attn.impl
+    if not isinstance(impl, TritonAttentionKeqVImpl):
+        return
+    try:
+        attn_meta, _, kv_cache, _ = get_attention_context(
+            next_layer.self_attn.attn.layer_name
+        )
+        if attn_meta is None or attn_meta.max_query_len != 1 or kv_cache is None:
+            return
+        TritonAttentionKeqVImpl._next_layer_prefetch_args = {
+            "impl": impl,
+            "kv_cache": kv_cache,
+            "block_table": attn_meta.block_table,
+            "seq_lens": attn_meta.seq_lens,
+        }
+    except Exception:
+        pass
+
+
 def _run_decoder_layers(
     decoder_layers: list[Gemma4DecoderLayer],
     layer_idx_start: int,
@@ -812,6 +872,10 @@ def _run_decoder_layers(
         layer_per_input = (
             per_layer_inputs[:, layer_idx, :] if per_layer_inputs is not None else None
         )
+        # Pre-queue the NEXT layer's KEQV prefetch so the current layer's
+        # attention kernel launches it at end of unified_attention, giving
+        # the current layer's o_proj + MLP as the full overlap window.
+        _queue_keqv_prefetch_for_next_layer(decoder_layers, idx + 1)
         hidden_states, residual = layer(
             positions,
             hidden_states,

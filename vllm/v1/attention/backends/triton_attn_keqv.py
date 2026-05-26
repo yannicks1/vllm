@@ -184,6 +184,131 @@ def reconstruct_k_from_v(
 
 
 # --------------------------------------------------------------------------
+# Last-block reconstruction kernel: only the newest token's block per seq
+# --------------------------------------------------------------------------
+
+
+@triton.jit
+def _reconstruct_k_last_block_kernel(
+    v_cache_ptr,
+    k_scratch_ptr,
+    k_norm_weight_ptr,
+    cos_sin_cache_ptr,
+    block_table_ptr,
+    seq_lens_ptr,
+    block_table_stride: tl.int64,
+    cache_stride_blk: tl.int64,
+    cache_stride_slot: tl.int64,
+    cache_stride_head: tl.int64,
+    cos_sin_stride: tl.int64,
+    BLOCK_SIZE: tl.constexpr,
+    HALF_HEAD: tl.constexpr,
+):
+    """Reconstruct K for the last (newest) block of each sequence only.
+
+    Grid: (num_seqs, num_kv_heads)
+    Used after do_kv_cache_update to handle only the newly written token slot,
+    while the side stream has already reconstructed all previous positions.
+    """
+    seq_idx = tl.program_id(0)
+    head_idx = tl.program_id(1)
+
+    seq_len = tl.load(seq_lens_ptr + seq_idx)
+    if seq_len == 0:
+        return
+
+    last_block_idx = (seq_len - 1) // BLOCK_SIZE
+    phys_block = tl.load(
+        block_table_ptr + seq_idx * block_table_stride + last_block_idx
+    ).to(tl.int64)
+
+    offs_slot = tl.arange(0, BLOCK_SIZE)
+    positions = last_block_idx * BLOCK_SIZE + offs_slot
+    # Only the new token's slot; avoids write-write race with the side stream
+    # which already wrote positions 0..(seq_len-2) concurrently.
+    slot_mask = positions == (seq_len - 1)
+
+    offs_half = tl.arange(0, HALF_HEAD)
+    w_first = tl.load(k_norm_weight_ptr + offs_half).to(tl.float32)
+    w_second = tl.load(k_norm_weight_ptr + HALF_HEAD + offs_half).to(tl.float32)
+
+    base_off = phys_block * cache_stride_blk + head_idx * cache_stride_head
+
+    v_first_off = base_off + offs_slot[:, None] * cache_stride_slot + offs_half[None, :]
+    V_first_raw = tl.load(v_cache_ptr + v_first_off, mask=slot_mask[:, None], other=0.0)
+    V_first = V_first_raw.to(tl.float32)
+
+    v_second_off = (
+        base_off
+        + offs_slot[:, None] * cache_stride_slot
+        + (HALF_HEAD + offs_half)[None, :]
+    )
+    V_second = tl.load(
+        v_cache_ptr + v_second_off, mask=slot_mask[:, None], other=0.0
+    ).to(tl.float32)
+
+    Kp_first = V_first * w_first[None, :]
+    Kp_second = V_second * w_second[None, :]
+
+    cos_off = positions[:, None] * cos_sin_stride + offs_half[None, :]
+    sin_off = positions[:, None] * cos_sin_stride + (HALF_HEAD + offs_half)[None, :]
+    cos_vals = tl.load(
+        cos_sin_cache_ptr + cos_off, mask=slot_mask[:, None], other=1.0
+    ).to(tl.float32)
+    sin_vals = tl.load(
+        cos_sin_cache_ptr + sin_off, mask=slot_mask[:, None], other=0.0
+    ).to(tl.float32)
+
+    K_first = Kp_first * cos_vals - Kp_second * sin_vals
+    K_second = Kp_second * cos_vals + Kp_first * sin_vals
+
+    tl.store(
+        k_scratch_ptr + v_first_off,
+        K_first.to(V_first_raw.dtype),
+        mask=slot_mask[:, None],
+    )
+    tl.store(
+        k_scratch_ptr + v_second_off,
+        K_second.to(V_first_raw.dtype),
+        mask=slot_mask[:, None],
+    )
+
+
+def reconstruct_k_last_block(
+    v_cache: torch.Tensor,
+    k_scratch: torch.Tensor,
+    k_norm_weight: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_size: int,
+    head_size: int,
+    num_kv_heads: int,
+):
+    """Reconstruct K for only the last block of each sequence."""
+    num_seqs = seq_lens.shape[0]
+    half_head = head_size // 2
+
+    grid = (num_seqs, num_kv_heads)
+
+    _reconstruct_k_last_block_kernel[grid](
+        v_cache_ptr=v_cache,
+        k_scratch_ptr=k_scratch,
+        k_norm_weight_ptr=k_norm_weight,
+        cos_sin_cache_ptr=cos_sin_cache,
+        block_table_ptr=block_table,
+        seq_lens_ptr=seq_lens,
+        block_table_stride=block_table.stride(0),
+        cache_stride_blk=v_cache.stride(0),
+        cache_stride_slot=v_cache.stride(1),
+        cache_stride_head=v_cache.stride(2),
+        cos_sin_stride=cos_sin_cache.stride(0),
+        BLOCK_SIZE=block_size,
+        HALF_HEAD=half_head,
+    )
+
+
+# --------------------------------------------------------------------------
 # Backend and Impl classes
 # --------------------------------------------------------------------------
 
@@ -263,11 +388,28 @@ class TritonAttentionKeqVImpl(TritonAttentionImpl):
     K = NeoX_RoPE(V * k_norm_weight) — algebraic identity from shared RMS norm.
     A lightweight Triton kernel reconstructs K for all positions into a shared
     scratch buffer, then the standard attention kernel runs unmodified.
+
+    Pipelining: launch_prefetch() launches K reconstruction for old positions
+    (seq_len - 1 tokens) on a side CUDA stream before QKV projection, overlapping
+    HBM-bandwidth-bound reconstruction with compute-bound QKV matmul. forward()
+    then reconstructs only the last block (new token) and waits for the side
+    stream before running attention.
+
+    Note: _prefetch_launched is a ClassVar that is safe in eager mode. In
+    torch.compile mode the branch is baked at trace time; the first trace
+    should happen during a decode step with launch_prefetch() active.
     """
 
     _shared_k_scratch: ClassVar[torch.Tensor | None] = None
     _memory_reservation: ClassVar[torch.Tensor | None] = None
     _reservation_device: ClassVar[torch.device | None] = None
+    _side_stream: ClassVar[torch.cuda.Stream | None] = None
+    _prefetch_event: ClassVar[torch.cuda.Event | None] = None
+    _prefetch_launched: ClassVar[bool] = False
+    # Set by _run_decoder_layers before layer[N] runs so that layer[N]'s
+    # forward() launches layer[N+1]'s prekernel right after unified_attention
+    # (while o_proj + MLP still run on the main stream → full inter-layer overlap).
+    _next_layer_prefetch_args: ClassVar[dict | None] = None
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -323,6 +465,74 @@ class TritonAttentionKeqVImpl(TritonAttentionImpl):
             cls._shared_k_scratch = torch.empty_like(kv_cache)
         return cls._shared_k_scratch
 
+    @classmethod
+    def _get_side_stream(cls) -> torch.cuda.Stream:
+        if cls._side_stream is None:
+            cls._side_stream = torch.cuda.Stream()
+        return cls._side_stream
+
+    @classmethod
+    def _get_prefetch_event(cls) -> torch.cuda.Event:
+        if cls._prefetch_event is None:
+            cls._prefetch_event = torch.cuda.Event()
+        return cls._prefetch_event
+
+    def launch_prefetch(
+        self,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ) -> None:
+        """Launch K reconstruction for old positions on a side CUDA stream.
+
+        Reconstructs K for positions 0..(seq_len-2) per sequence — the new
+        token has not been written to the V cache yet, so we exclude it.
+        The result overlaps with QKV projection on the main stream.
+
+        Must be called before do_kv_cache_update() for this layer. forward()
+        will then reconstruct only the last block and wait for this event.
+        """
+        if TritonAttentionKeqVImpl._prefetch_launched:
+            return  # already launched (inter-layer hook beat us here)
+
+        assert self._rotary_emb is not None and self._k_norm_weight is not None
+
+        # Ensure scratch buffer is allocated on the main stream before we fork.
+        k_scratch = self._get_k_scratch(kv_cache)
+
+        cos_sin_cache = self._rotary_emb.cos_sin_cache
+        if cos_sin_cache.dtype != kv_cache.dtype:
+            cos_sin_cache = cos_sin_cache.to(dtype=kv_cache.dtype)
+        if cos_sin_cache.device != kv_cache.device:
+            cos_sin_cache = cos_sin_cache.to(device=kv_cache.device)
+
+        # seq_lens includes the new token; exclude it to avoid reading a slot
+        # that hasn't been written yet.
+        seq_lens_prev = (seq_lens - 1).clamp(min=0)
+
+        side_stream = self._get_side_stream()
+        event = self._get_prefetch_event()
+
+        # Ensure side stream sees all main-stream work submitted so far
+        # (e.g. prior layers' do_kv_cache_update).
+        side_stream.wait_stream(torch.cuda.current_stream())
+
+        with torch.cuda.stream(side_stream):
+            reconstruct_k_from_v(
+                v_cache=kv_cache,
+                k_scratch=k_scratch,
+                k_norm_weight=self._k_norm_weight,
+                cos_sin_cache=cos_sin_cache,
+                block_table=block_table,
+                seq_lens=seq_lens_prev,
+                block_size=kv_cache.shape[1],
+                head_size=kv_cache.shape[3],
+                num_kv_heads=kv_cache.shape[2],
+            )
+            event.record()
+
+        TritonAttentionKeqVImpl._prefetch_launched = True
+
     def forward(
         self,
         layer: torch.nn.Module,
@@ -373,17 +583,38 @@ class TritonAttentionKeqVImpl(TritonAttentionImpl):
         num_kv_heads = kv_cache.shape[2]
         head_size = kv_cache.shape[3]
 
-        reconstruct_k_from_v(
-            v_cache=kv_cache,
-            k_scratch=k_scratch,
-            k_norm_weight=self._k_norm_weight,
-            cos_sin_cache=cos_sin_cache,
-            block_table=attn_metadata.block_table,
-            seq_lens=attn_metadata.seq_lens,
-            block_size=block_size,
-            head_size=head_size,
-            num_kv_heads=num_kv_heads,
-        )
+        if TritonAttentionKeqVImpl._prefetch_launched:
+            # Pipelined path: side stream already reconstructed old positions.
+            # Reconstruct only the last block (new token) on the main stream,
+            # then wait for the side stream to finish old positions.
+            TritonAttentionKeqVImpl._prefetch_launched = False
+            reconstruct_k_last_block(
+                v_cache=kv_cache,
+                k_scratch=k_scratch,
+                k_norm_weight=self._k_norm_weight,
+                cos_sin_cache=cos_sin_cache,
+                block_table=attn_metadata.block_table,
+                seq_lens=attn_metadata.seq_lens,
+                block_size=block_size,
+                head_size=head_size,
+                num_kv_heads=num_kv_heads,
+            )
+            torch.cuda.current_stream().wait_event(
+                TritonAttentionKeqVImpl._prefetch_event
+            )
+        else:
+            # Fallback: full reconstruction on main stream (prefill or first step).
+            reconstruct_k_from_v(
+                v_cache=kv_cache,
+                k_scratch=k_scratch,
+                k_norm_weight=self._k_norm_weight,
+                cos_sin_cache=cos_sin_cache,
+                block_table=attn_metadata.block_table,
+                seq_lens=attn_metadata.seq_lens,
+                block_size=block_size,
+                head_size=head_size,
+                num_kv_heads=num_kv_heads,
+            )
 
         # --- Standard attention kernel (unmodified) ---
         unified_attention(
@@ -418,6 +649,18 @@ class TritonAttentionKeqVImpl(TritonAttentionImpl):
             v_scale_cache=None,
             chunk_lookback=self.chunk_lookback,
         )
+
+        # Inter-layer pipeline: launch the next keqv layer's pre-kernel NOW,
+        # right after attention. The main stream will proceed with o_proj + MLP
+        # while the side stream reconstructs K for the next layer — full overlap.
+        args = TritonAttentionKeqVImpl._next_layer_prefetch_args
+        if args is not None:
+            TritonAttentionKeqVImpl._next_layer_prefetch_args = None
+            args["impl"].launch_prefetch(
+                kv_cache=args["kv_cache"],
+                block_table=args["block_table"],
+                seq_lens=args["seq_lens"],
+            )
 
         return output
 
