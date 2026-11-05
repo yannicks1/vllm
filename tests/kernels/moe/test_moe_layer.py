@@ -2317,10 +2317,11 @@ def _biased_moe_tp_worker(rank: int, tp_size: int, port: int, result_path: str):
             init_workspace_manager(device)
 
         num_experts, top_k, hidden, intermediate, num_tokens = 8, 2, 128, 256, 16
-        generator = torch.Generator().manual_seed(0)
+        generator = torch.Generator(device="cpu").manual_seed(0)
 
         def randn(*shape: int, scale: float = 1.0) -> torch.Tensor:
-            return (torch.randn(*shape, generator=generator) * scale).to(device)
+            sample = torch.randn(*shape, generator=generator, device="cpu")
+            return (sample * scale).to(device)
 
         w13 = randn(num_experts, 2 * intermediate, hidden, scale=0.05)
         w2 = randn(num_experts, hidden, intermediate, scale=0.05)
