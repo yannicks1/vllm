@@ -1609,3 +1609,77 @@ class TestCpuTopkTopp:
             f"batch_size={batch_size}, vocab_size={vocab_size}.\n"
             f"Max abs diff: {(fused - seq).abs().max().item():.2e}"
         )
+
+    @pytest.mark.parametrize("vocab_size, start", [(41, 0), (32771, 100)])
+    @pytest.mark.parametrize("shift", [-3.125, 0.0, 2.5])
+    @pytest.mark.parametrize("use_k", [False, True])
+    def test_topp_boundary_tie_quota(
+        self, vocab_size: int, start: int, shift: float, use_k: bool
+    ):
+        """A tie group at the top-p cut keeps only the copies p needs."""
+        num_ties = 41
+        p = torch.tensor([0.05, 0.5, 0.9, 0.99, 1.0])
+        logits = torch.full((len(p), vocab_size), float("-inf"))
+        logits[:, start : start + num_ties] = shift
+        # k above the number of finite logits masks nothing; when k < vocab
+        # it runs the fused top-k + top-p kernel.
+        k = torch.full((len(p),), 64, dtype=torch.int32) if use_k else None
+
+        result = apply_top_k_top_p_cpu(logits.clone(), k, p)
+        kept = result != float("-inf")
+        num_kept = kept.sum(dim=-1)
+        assert num_kept.tolist() == [3, 21, 37, 41, 41]
+        # The kept copies are the first ones in index order.
+        kept_ties = kept[:, start : start + num_ties]
+        assert torch.equal(kept_ties, torch.arange(num_ties) < num_kept[:, None])
+        assert torch.equal(result[kept], logits[kept])
+
+    @pytest.mark.parametrize("gap", [5e-6, 0.25])
+    @pytest.mark.parametrize("shift", [-3.125, 0.0, 2.5])
+    def test_topp_keeps_strictly_higher_logits(self, gap: float, shift: float):
+        """No dropped logit is higher than a kept one, even within 1e-5."""
+        p = torch.tensor([0.05, 0.1, 0.5, 0.9, 0.99])
+        logits = torch.full((len(p), 60), shift)
+        logits[:, 20:] += gap
+
+        result = apply_top_k_top_p_cpu(logits.clone(), None, p)
+        expected = apply_top_k_top_p_pytorch(logits.clone(), None, p)
+        kept = result != float("-inf")
+        assert torch.equal(kept.sum(dim=-1), (expected != float("-inf")).sum(dim=-1))
+        lowest_kept = torch.where(kept, logits, float("inf")).amin(dim=-1)
+        highest_dropped = torch.where(kept, float("-inf"), logits).amax(dim=-1)
+        assert (highest_dropped <= lowest_kept).all()
+
+    @pytest.mark.parametrize("p", [0.9, 0.999, 0.99999])
+    @pytest.mark.parametrize("kind", ["randn", "fp16", "flat_tail"])
+    @pytest.mark.parametrize("use_k", [False, True])
+    def test_topp_keeps_smallest_set_reaching_p(self, p: float, kind: str, use_k: bool):
+        """Top-p keeps the smallest set of highest logits whose mass reaches p."""
+        batch_size, vocab_size = 8, 32771
+        if kind == "flat_tail":
+            logits = torch.full((batch_size, vocab_size), -20.0)
+            logits[:, -1] = 0.0
+        else:
+            logits = 2 * torch.randn(
+                batch_size, vocab_size, generator=self.generator, dtype=torch.float32
+            )
+            if kind == "fp16":
+                logits = logits.half().float()
+        # With k at the number of finite logits, top-k masks nothing and the
+        # fused kernel's top-p sees the same row.
+        logits[:, :16] = float("-inf")
+        k = torch.full((batch_size,), vocab_size - 16, dtype=torch.int32)
+        p_t = torch.full((batch_size,), p, dtype=torch.float32)
+
+        result = apply_top_k_top_p_cpu(logits.clone(), k if use_k else None, p_t)
+        kept = result != float("-inf")
+        assert torch.equal(result[kept], logits[kept])
+        probs = logits.double().softmax(dim=-1)
+        mass = torch.where(kept, probs, 0.0).sum(dim=-1)
+        least = torch.where(kept, probs, float("inf")).amin(dim=-1)
+        p_d = p_t.double()
+        assert (mass >= p_d - 1e-6).all(), (mass - p_d).min().item()
+        assert (mass - least < p_d + 1e-6).all(), (mass - least - p_d).max().item()
+        lowest_kept = torch.where(kept, logits, float("inf")).amin(dim=-1)
+        highest_dropped = torch.where(kept, float("-inf"), logits).amax(dim=-1)
+        assert (highest_dropped <= lowest_kept).all()

@@ -9,7 +9,7 @@
 
 namespace {
 constexpr float kPadSentinel = -1e30f;      // logits below this are PAD
-constexpr float kBoundaryTol = 1e-5f;       // tie tolerance for top-p cut
+constexpr float kBoundaryTol = 1e-5f;       // near-max tolerance for p <= 0
 constexpr int kMeanStdSampleN = 8192;       // mean/std sample cap
 constexpr int kBsearchMaxIters = 32;        // binary-search iteration cap
 constexpr int kTernarySearchMaxIters = 18;  // matches Triton
@@ -108,6 +108,10 @@ static inline int hsum_i32(vi32 v) { return v[0] + v[1] + v[2] + v[3]; }
 
 static inline float hmin_f32(vf32 v) {
   return std::min(std::min(v[0], v[1]), std::min(v[2], v[3]));
+}
+
+static inline float hmax_f32(vf32 v) {
+  return std::max(std::max(v[0], v[1]), std::max(v[2], v[3]));
 }
 
 struct Fp64Acc16 {
@@ -235,6 +239,124 @@ FORCE_INLINE static void mask_write_below(float* row, int V, float threshold,
     if (!(row[i] > threshold)) row[i] = fill;
 }
 
+// Least and greatest buf[i] in (lo, hi]: +inf and -inf if there is none.
+FORCE_INLINE static void min_max_in_range(const float* buf, int n, float lo,
+                                          float hi, float* min_out,
+                                          float* max_out) {
+  const float inf = std::numeric_limits<float>::infinity();
+  float mn = inf, mx = -inf;
+  int j = 0;
+#if defined(__aarch64__)
+  const float32x4_t vlo = vdupq_n_f32(lo);
+  const float32x4_t vhi = vdupq_n_f32(hi);
+  const float32x4_t pos_inf = vdupq_n_f32(inf);
+  const float32x4_t neg_inf = vdupq_n_f32(-inf);
+  float32x4_t vmin = pos_inf, vmax = neg_inf;
+  for (; j + 16 <= n; j += 16) {
+    for (int r = 0; r < 4; ++r) {
+      const float32x4_t v = vld1q_f32(buf + j + 4 * r);
+      const uint32x4_t in = vandq_u32(vcgtq_f32(v, vlo), vcleq_f32(v, vhi));
+      vmin = vminq_f32(vmin, vbslq_f32(in, v, pos_inf));
+      vmax = vmaxq_f32(vmax, vbslq_f32(in, v, neg_inf));
+    }
+  }
+  mn = vminvq_f32(vmin);
+  mx = vmaxvq_f32(vmax);
+#elif defined(__powerpc__) || defined(__s390x__)
+  const vf32 vlo = vec_splats(lo);
+  const vf32 vhi = vec_splats(hi);
+  const vf32 pos_inf = vec_splats(inf);
+  const vf32 neg_inf = vec_splats(-inf);
+  vf32 vmin = pos_inf, vmax = neg_inf;
+  for (; j + 16 <= n; j += 16) {
+    for (int r = 0; r < 4; ++r) {
+      const vf32 v = vec_xl(0, buf + j + 4 * r);
+      const auto in = vec_and(vec_cmpgt(v, vlo), vec_cmpge(vhi, v));
+      vmin = vec_min(vmin, vec_sel(pos_inf, v, in));
+      vmax = vec_max(vmax, vec_sel(neg_inf, v, in));
+    }
+  }
+  mn = hmin_f32(vmin);
+  mx = hmax_f32(vmax);
+#endif
+  for (; j < n; ++j) {
+    const float v = buf[j];
+    if (v > lo && v <= hi) {
+      mn = std::min(mn, v);
+      mx = std::max(mx, v);
+    }
+  }
+  *min_out = mn;
+  *max_out = mx;
+}
+
+// Keeps row[i] where probs[i] > boundary, plus the first `quota` (in row
+// order) where probs[i] == boundary; masks the rest with fill. Only a chunk
+// where the quota runs out is scalar.
+FORCE_INLINE static void mask_by_prob(float* row, const float* probs, int V,
+                                      float boundary, int quota, float fill) {
+  auto keep_scalar = [&](int i) {
+    const float prob = probs[i];
+    bool keep = prob > boundary;
+    if (prob == boundary && quota > 0) {
+      keep = true;
+      --quota;
+    }
+    if (!keep) row[i] = fill;
+  };
+  int i = 0;
+#if defined(__aarch64__)
+  const float32x4_t vb = vdupq_n_f32(boundary);
+  const float32x4_t fv = vdupq_n_f32(fill);
+  for (; i + 16 <= V; i += 16) {
+    float32x4_t pr[4];
+    uint32x4_t keep[4];
+    uint32x4_t eq_cnt = vdupq_n_u32(0);
+    for (int r = 0; r < 4; ++r) {
+      pr[r] = vld1q_f32(probs + i + 4 * r);
+      eq_cnt = vsubq_u32(eq_cnt, vceqq_f32(pr[r], vb));
+    }
+    const int n_eq = (int)vaddvq_u32(eq_cnt);
+    if (n_eq > quota && quota > 0) {
+      for (int k = i; k < i + 16; ++k) keep_scalar(k);
+      continue;
+    }
+    const bool keep_eq = n_eq > 0 && quota > 0;
+    if (keep_eq) quota -= n_eq;
+    for (int r = 0; r < 4; ++r)
+      keep[r] = keep_eq ? vcgeq_f32(pr[r], vb) : vcgtq_f32(pr[r], vb);
+    for (int r = 0; r < 4; ++r) {
+      const float32x4_t v = vld1q_f32(row + i + 4 * r);
+      vst1q_f32(row + i + 4 * r, vbslq_f32(keep[r], v, fv));
+    }
+  }
+#elif defined(__powerpc__) || defined(__s390x__)
+  const vf32 vb = vec_splats(boundary);
+  const vf32 fv = vec_splats(fill);
+  for (; i + 16 <= V; i += 16) {
+    vf32 pr[4];
+    vi32 eq_cnt = vec_splats(0);
+    for (int r = 0; r < 4; ++r) {
+      pr[r] = vec_xl(0, probs + i + 4 * r);
+      eq_cnt -= (vi32)vec_cmpeq(pr[r], vb);
+    }
+    const int n_eq = hsum_i32(eq_cnt);
+    if (n_eq > quota && quota > 0) {
+      for (int k = i; k < i + 16; ++k) keep_scalar(k);
+      continue;
+    }
+    const bool keep_eq = n_eq > 0 && quota > 0;
+    if (keep_eq) quota -= n_eq;
+    for (int r = 0; r < 4; ++r) {
+      const vf32 v = vec_xl(0, row + i + 4 * r);
+      const auto keep = keep_eq ? vec_cmpge(pr[r], vb) : vec_cmpgt(pr[r], vb);
+      vec_xst(vec_sel(fv, v, keep), 0, row + i + 4 * r);
+    }
+  }
+#endif
+  for (; i < V; ++i) keep_scalar(i);
+}
+
 // Vectorised max/min/finite-count over row[0..V). PAD lanes (<= pad_sentinel)
 // are blended to +inf so they don't corrupt reduce_min. Returns SIMD tail
 // start in *tail_i_out; caller handles remaining elements and clamps min<=max.
@@ -335,7 +457,7 @@ static inline void compute_mean_std(const float* row, int V, float* avg_out,
 
 // Apply boundary-tie resolution in row order. Keeps all v > pivot, plus up to
 // n_keep_at_boundary values within tol of dup_value. Rare path: called only
-// when binary/ternary search lands exactly on a duplicate boundary value.
+// when the top-k ternary search lands exactly on a duplicate boundary value.
 static inline void apply_boundary_tie_loop(float* row, int V, float pivot,
                                            float dup_value, float tol,
                                            int n_keep_at_boundary) {
@@ -403,14 +525,34 @@ static void check_batch_int(const torch::Tensor& t, const torch::Tensor& logits,
               " must be 1D with size == batch size");
 }
 
-static float binary_search_buffer(const float* buf, int n, float p_val,
+static float binary_search_buffer(const float* buf, int n, double target,
                                   float lo, float hi, double* sum_above_out) {
   double s_hi = 0.0;
   for (int iter = 0; iter < kBsearchMaxIters; ++iter) {
     float mid = lo + (hi - lo) * 0.5f;
     if (mid == lo || mid == hi) break;
     double s = sum_gt_to_double(buf, n, mid);
-    if (s >= (double)p_val) {
+    if (s >= target) {
+      lo = mid;
+    } else {
+      hi = mid;
+      s_hi = s;
+    }
+  }
+  // At the iteration cap, stored values can remain in (lo, hi) and would be
+  // dropped. Bisect on the stored values until (lo, hi] holds one of them.
+  while (std::nextafter(lo, hi) < hi) {
+    float mn, mx;
+    min_max_in_range(buf, n, lo, hi, &mn, &mx);
+    if (!(mn < hi)) break;
+    if (mn == mx) {
+      hi = mn;  // nothing lies in (mn, hi], so s_hi still holds
+      break;
+    }
+    float mid = mn + (mx - mn) * 0.5f;
+    if (!(mid < mx)) mid = mn;  // each step must drop mn or mx
+    double s = sum_gt_to_double(buf, n, mid);
+    if (s >= target) {
       lo = mid;
     } else {
       hi = mid;
@@ -606,54 +748,68 @@ static void _top_p_row_core(float* __restrict__ row, int V, float p_val,
 #if defined(__aarch64__) || defined(__powerpc__) || defined(__s390x__)
   DEFINE_FAST_EXP
   vec_op::FP32Vec16 base16(st.max_l);
+  auto exp16 = [&](const vec_op::FP32Vec16& v16) {
+    vec_op::FP32Vec16 e16 = fast_exp(v16 - base16);
+  #if defined(__powerpc__) || defined(__s390x__)
+    e16 = zero_pad_lanes(v16, e16);
+  #endif
+    return e16;
+  };
+  // The tail goes through the same exp, padded with -inf: the tie quota needs
+  // equal logits to get equal probabilities.
+  const int v_vec = V & ~15;
+  alignas(64) float tail[16];
+  std::fill(tail, tail + 16, neg_inf);
+  std::copy(row + v_vec, row + V, tail);
 #endif
   double sum_exp_d = 0.0;
   {
     int i = 0;
 #if defined(__aarch64__) || defined(__powerpc__) || defined(__s390x__)
     Fp64Acc16 acc;
-    for (; i + 16 <= V; i += 16) {
-      vec_op::FP32Vec16 v16(row + i);
-      vec_op::FP32Vec16 e16 = fast_exp(v16 - base16);
-  #if defined(__powerpc__) || defined(__s390x__)
-      e16 = zero_pad_lanes(v16, e16);
-  #endif
-      acc.add(e16);
+    for (; i < v_vec; i += 16) acc.add(exp16(vec_op::FP32Vec16(row + i)));
+    if (i < V) {
+      acc.add(exp16(vec_op::FP32Vec16(tail)));
+      i = V;
     }
     sum_exp_d += acc.reduce();
 #endif
     for (; i < V; ++i) sum_exp_d += (double)expf(row[i] - st.max_l);
   }
   float sum_exp = (float)sum_exp_d;
+  const float inv_sum = 1.0f / sum_exp;
+  // The rounded inv_sum scales every stored probability: aim at p of their
+  // actual total, not of one.
+  const double p_target = (double)p_val * (sum_exp_d * (double)inv_sum);
 
   float outlier_prob = expf(outlier_logit - st.max_l) / sum_exp;
   float max_prob = 1.0f / sum_exp;
   float min_prob = expf(st.min_l - st.max_l) / sum_exp;
 
-  double sum_out_d = 0.0;
   {
-    const float inv_sum = 1.0f / sum_exp;
     int i = 0;
 #if defined(__aarch64__) || defined(__powerpc__) || defined(__s390x__)
     vec_op::FP32Vec16 isum16(inv_sum);
-    for (; i + 16 <= V; i += 16) {
-      vec_op::FP32Vec16 v16(row + i);
-      vec_op::FP32Vec16 p16 = fast_exp(v16 - base16) * isum16;
-  #if defined(__powerpc__) || defined(__s390x__)
-      p16 = zero_pad_lanes(v16, p16);
-  #endif
-      p16.save(scratch + i);
+    for (; i < v_vec; i += 16)
+      (exp16(vec_op::FP32Vec16(row + i)) * isum16).save(scratch + i);
+    if (i < V) {
+      (exp16(vec_op::FP32Vec16(tail)) * isum16).save(tail);
+      std::copy(tail, tail + (V - i), scratch + i);
+      i = V;
     }
 #endif
     for (; i < V; ++i) scratch[i] = expf(row[i] - st.max_l) * inv_sum;
   }
-  int n_out =
-      gather_outliers(scratch, V, outlier_prob, outlier_buf, &sum_out_d);
+  const bool use_outliers =
+      sum_gt_to_double(scratch, V, outlier_prob) >= p_target;
+  const int n_out = use_outliers ? gather_outliers(scratch, V, outlier_prob,
+                                                   outlier_buf, nullptr)
+                                 : 0;
 
   float* sbuf;
   int sn;
   float buf_lo, buf_hi;
-  if (sum_out_d >= (double)p_val) {
+  if (use_outliers) {
     sbuf = outlier_buf;
     sn = n_out;
     buf_hi = max_prob;
@@ -662,40 +818,36 @@ static void _top_p_row_core(float* __restrict__ row, int V, float p_val,
     sbuf = scratch;
     sn = V;
     buf_hi = max_prob;
-    buf_lo = min_prob;
+    // A p near one can need the minimum-probability group, so start below it,
+    // with a margin for fast_exp vs expf.
+    buf_lo = min_prob * (1.0f - 0x1p-12f);
   }
 
-  double sum_above;
-  float boundary_prob =
-      binary_search_buffer(sbuf, sn, p_val, buf_lo, buf_hi, &sum_above);
+  double sum_above = 0.0;
+  float boundary_prob;
+  if (st.max_l == st.min_l) {
+    // All finite logits are equal: one tie group, nothing to search.
+    float unused;
+    min_max_in_range(scratch, V, 0.0f, std::numeric_limits<float>::infinity(),
+                     &boundary_prob, &unused);
+  } else {
+    boundary_prob =
+        binary_search_buffer(sbuf, sn, p_target, buf_lo, buf_hi, &sum_above);
+  }
 
-  float dup_logit = logf(boundary_prob * sum_exp) + st.max_l;
-
-  // NaN or overflow above max_l means binary search degenerated; skip masking.
-  if (!(dup_logit <= st.max_l)) {
+  // NaN or inf means the softmax degenerated; skip masking.
+  if (!(boundary_prob > 0.0f) || !std::isfinite(boundary_prob)) {
     return;
   }
 
-  int n_at_boundary = count_within_tol(row, V, dup_logit, kBoundaryTol);
-
   int n_keep_at_boundary = 0;
-  if (n_at_boundary > 0) {
-    double remaining = (double)p_val - sum_above;
-    if (remaining > 0.0 && (double)boundary_prob > 0.0) {
-      double needed_d = ceil(remaining / (double)boundary_prob);
-      if (needed_d >= (double)n_at_boundary)
-        n_keep_at_boundary = n_at_boundary;
-      else if (needed_d > 0.0)
-        n_keep_at_boundary = (int)needed_d;
-    }
-  }
+  double remaining = p_target - sum_above;
+  if (remaining > 0.0)
+    n_keep_at_boundary =
+        (int)std::min(ceil(remaining / (double)boundary_prob), (double)V);
 
-  if (n_keep_at_boundary == 0) {
-    mask_write_below(row, V, dup_logit, neg_inf);
-  } else {
-    apply_boundary_tie_loop(row, V, dup_logit, dup_logit, kBoundaryTol,
-                            n_keep_at_boundary);
-  }
+  // Cut on the probabilities the search used, so each tie group is exact.
+  mask_by_prob(row, scratch, V, boundary_prob, n_keep_at_boundary, neg_inf);
 }
 
 static void top_k_row(float* __restrict__ row, int V, int k_val,
